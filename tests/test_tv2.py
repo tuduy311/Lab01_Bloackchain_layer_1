@@ -10,6 +10,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from src.models import (
     Block, Transaction, Vote, Phase, Message, MessageType,
     FinalizeCertificate, NIL_BLOCK_ID, genesis_block, _canonical_json,
+    ValidatorSet, Polka,
 )
 from src.crypto import (
     generate_keypair, sign, verify, sha256_hex,
@@ -17,11 +18,12 @@ from src.crypto import (
     sign_vote, verify_vote_signature,
     sign_transaction, verify_transaction_signature,
     public_key_from_private,
+    ValidatorKeyStore,
 )
 from src.execution import (
     AccountState, WorldState, TxResult,
     validate_transaction, apply_transaction, execute_block,
-    create_genesis_state,
+    create_genesis_state, validate_block, BlockValidationResult,
 )
 
 
@@ -38,6 +40,21 @@ def _make_signed_tx(sender_priv, sender_pub, receiver_pub, amount, nonce):
     tx = Transaction(sender=sender_pub, receiver=receiver_pub,
                      amount=amount, nonce=nonce)
     return sign_transaction(tx, sender_priv)
+
+
+def _make_signed_block(height, round_, parent_id, proposer_priv, proposer_pub,
+                       transactions=(), state_root="", timestamp=0.0):
+    """Create a fully signed Block with correct block_id."""
+    b = Block(
+        height=height,
+        round=round_,
+        parent_id=parent_id,
+        transactions=transactions,
+        proposer_id=proposer_pub,
+        timestamp=timestamp,
+        state_root=state_root,
+    )
+    return sign_block(b, proposer_priv)
 
 
 # =========================================================================
@@ -59,6 +76,16 @@ class TestTransaction:
         tx = Transaction("aaa", "bbb", 42, 7, "sig123")
         assert Transaction.from_dict(tx.to_dict()) == tx
 
+    def test_different_amounts_differ(self):
+        tx1 = Transaction("a", "b", 10, 0)
+        tx2 = Transaction("a", "b", 20, 0)
+        assert tx1.canonical_bytes() != tx2.canonical_bytes()
+
+    def test_different_nonces_differ(self):
+        tx1 = Transaction("a", "b", 10, 0)
+        tx2 = Transaction("a", "b", 10, 1)
+        assert tx1.canonical_bytes() != tx2.canonical_bytes()
+
 
 class TestBlock:
     def test_canonical_excludes_block_id_and_sig(self):
@@ -66,11 +93,22 @@ class TestBlock:
         b2 = Block(height=1, round=0, parent_id="p", block_id="xyz", signature="sig")
         assert b1.canonical_bytes() == b2.canonical_bytes()
 
+    def test_state_root_is_part_of_canonical(self):
+        b1 = Block(height=1, round=0, parent_id="p", state_root="")
+        b2 = Block(height=1, round=0, parent_id="p", state_root="abc123")
+        # state_root is included in canonical content → different block_ids
+        assert compute_block_id(b1) != compute_block_id(b2)
+
     def test_roundtrip_dict(self):
         tx = Transaction("s", "r", 10, 0, "sig")
         b = Block(height=1, round=2, parent_id="p", transactions=(tx,),
-                  proposer_id="prop", timestamp=1.5, block_id="bid", signature="bsig")
+                  proposer_id="prop", timestamp=1.5, state_root="sr",
+                  block_id="bid", signature="bsig")
         assert Block.from_dict(b.to_dict()) == b
+
+    def test_state_root_survives_roundtrip(self):
+        b = Block(height=1, round=0, parent_id="p", state_root="deadbeef")
+        assert Block.from_dict(b.to_dict()).state_root == "deadbeef"
 
 
 class TestVote:
@@ -78,10 +116,27 @@ class TestVote:
         v = Vote(1, 0, Phase.PREVOTE, NIL_BLOCK_ID, "voter1")
         assert v.is_nil
 
+    def test_non_nil_vote(self):
+        v = Vote(1, 0, Phase.PREVOTE, "block1", "voter1")
+        assert not v.is_nil
+
     def test_canonical_deterministic(self):
         v1 = Vote(1, 0, Phase.PREVOTE, "block1", "v1")
         v2 = Vote(1, 0, Phase.PREVOTE, "block1", "v1")
         assert v1.canonical_bytes() == v2.canonical_bytes()
+
+    def test_canonical_covers_all_fields(self):
+        """Changing any payload field must change the canonical bytes."""
+        base = Vote(1, 0, Phase.PREVOTE, "block1", "v1")
+        cases = [
+            Vote(2, 0, Phase.PREVOTE, "block1", "v1"),   # height differs
+            Vote(1, 1, Phase.PREVOTE, "block1", "v1"),   # round differs
+            Vote(1, 0, Phase.PRECOMMIT, "block1", "v1"), # phase differs
+            Vote(1, 0, Phase.PREVOTE, "block2", "v1"),   # block_id differs
+            Vote(1, 0, Phase.PREVOTE, "block1", "v2"),   # voter_id differs
+        ]
+        for other in cases:
+            assert base.canonical_bytes() != other.canonical_bytes()
 
     def test_roundtrip_dict(self):
         v = Vote(1, 0, Phase.PRECOMMIT, "block1", "v1", "sig")
@@ -113,6 +168,86 @@ class TestGenesis:
         g1 = genesis_block()
         g2 = genesis_block()
         assert g1.block_id == g2.block_id
+
+    def test_genesis_has_no_signature(self):
+        g = genesis_block()
+        assert g.signature == ""
+
+    def test_genesis_empty_parent(self):
+        g = genesis_block()
+        assert g.parent_id == ""
+
+
+class TestValidatorSet:
+    def test_basic_creation(self):
+        vs = ValidatorSet(("v1", "v2", "v3", "v4"), f=1)
+        assert vs.n == 4
+        assert vs.quorum == 3
+        assert "v1" in vs
+
+    def test_quorum_formula(self):
+        # quorum = 2f+1
+        assert ValidatorSet(("a", "b", "c", "d"), f=1).quorum == 3
+        assert ValidatorSet(("a", "b", "c", "d", "e", "f", "g"), f=2).quorum == 5
+
+    def test_from_public_keys(self):
+        keys = [generate_keypair()[1] for _ in range(4)]
+        vs = ValidatorSet.from_public_keys(keys)
+        assert vs.n == 4
+        assert vs.f == 1  # (4-1)//3 = 1
+
+    def test_invalid_duplicate_validators(self):
+        with pytest.raises(ValueError, match="unique"):
+            ValidatorSet(("v1", "v1"), f=0)
+
+    def test_invalid_empty(self):
+        with pytest.raises(ValueError):
+            ValidatorSet((), f=0)
+
+    def test_invalid_f_too_large(self):
+        with pytest.raises(ValueError, match="3f\\+1"):
+            ValidatorSet(("v1", "v2"), f=1)  # need n>=4, got n=2
+
+    def test_negative_f(self):
+        with pytest.raises(ValueError, match="f must be"):
+            ValidatorSet(("v1",), f=-1)
+
+    def test_roundtrip_dict(self):
+        vs = ValidatorSet(("v1", "v2", "v3", "v4"), f=1)
+        assert ValidatorSet.from_dict(vs.to_dict()) == vs
+
+    def test_contains_and_len(self):
+        vs = ValidatorSet(("v1", "v2", "v3", "v4"), f=1)
+        assert "v1" in vs
+        assert "v5" not in vs
+        assert len(vs) == 4
+
+    def test_iteration(self):
+        validators = ("v1", "v2", "v3", "v4")
+        vs = ValidatorSet(validators, f=1)
+        assert tuple(vs) == validators
+
+
+class TestPolkaModel:
+    def test_roundtrip_dict(self):
+        votes = tuple(
+            Vote(1, 0, Phase.PREVOTE, "bid", f"v{i}", "sig")
+            for i in range(3)
+        )
+        polka = Polka(1, 0, "bid", votes)
+        restored = Polka.from_dict(polka.to_dict())
+        assert restored == polka
+
+    def test_polka_stores_votes(self):
+        votes = tuple(
+            Vote(2, 1, Phase.PREVOTE, "block_xyz", f"voter_{i}")
+            for i in range(3)
+        )
+        polka = Polka(2, 1, "block_xyz", votes)
+        assert polka.height == 2
+        assert polka.round == 1
+        assert polka.block_id == "block_xyz"
+        assert len(polka.votes) == 3
 
 
 # =========================================================================
@@ -151,6 +286,13 @@ class TestCryptoBasic:
         priv, pub = generate_keypair()
         assert public_key_from_private(priv) == pub
 
+    def test_different_data_gives_different_sig(self):
+        """Signatures are deterministic per private key but differ for different data."""
+        priv, pub = generate_keypair()
+        sig1 = sign(b"data1", priv)
+        sig2 = sign(b"data2", priv)
+        assert sig1 != sig2
+
 
 class TestBlockCrypto:
     def test_sign_and_verify_block(self):
@@ -167,6 +309,27 @@ class TestBlockCrypto:
         b2 = Block(height=1, round=1, parent_id="p")  # different round
         assert compute_block_id(b1) != compute_block_id(b2)
 
+    def test_block_id_changes_with_state_root(self):
+        b1 = Block(height=1, round=0, parent_id="p", state_root="")
+        b2 = Block(height=1, round=0, parent_id="p", state_root="abc")
+        assert compute_block_id(b1) != compute_block_id(b2)
+
+    def test_sign_block_preserves_state_root(self):
+        priv, pub = generate_keypair()
+        b = Block(height=1, round=0, parent_id="p", proposer_id=pub, state_root="sr123")
+        signed = sign_block(b, priv)
+        assert signed.state_root == "sr123"
+        assert verify_block_id(signed)
+
+    def test_tampered_block_fails_id_check(self):
+        priv, pub = generate_keypair()
+        b = Block(height=1, round=0, parent_id="p", proposer_id=pub)
+        signed = sign_block(b, priv)
+        # Tamper with block_id
+        import dataclasses
+        tampered = dataclasses.replace(signed, block_id="bad_id")
+        assert not verify_block_id(tampered)
+
 
 class TestVoteCrypto:
     def test_sign_and_verify_vote(self):
@@ -182,6 +345,17 @@ class TestVoteCrypto:
         v = Vote(1, 0, Phase.PREVOTE, "block1", pub)
         signed = sign_vote(v, priv)
         assert not verify_vote_signature(signed, pub2)
+
+    def test_nil_vote_can_be_signed(self):
+        priv, pub = generate_keypair()
+        v = Vote(1, 0, Phase.PREVOTE, NIL_BLOCK_ID, pub)
+        signed = sign_vote(v, priv)
+        assert verify_vote_signature(signed, pub)
+
+    def test_unsigned_vote_fails(self):
+        _, pub = generate_keypair()
+        v = Vote(1, 0, Phase.PREVOTE, "block1", pub, signature="")
+        assert not verify_vote_signature(v, pub)
 
 
 class TestTransactionCrypto:
@@ -202,6 +376,68 @@ class TestTransactionCrypto:
         signed_bad = Transaction(sender=pub1, receiver="recv",
                                  amount=50, nonce=0, signature=signed.signature)
         assert not verify_transaction_signature(signed_bad)
+
+
+class TestValidatorKeyStore:
+    def test_creation_and_lookup(self):
+        store = ValidatorKeyStore(["v1", "v2", "v3", "v4"])
+        assert len(store) == 4
+        priv = store.private_key("v1")
+        pub = store.public_key("v1")
+        assert len(priv) == 64
+        assert len(pub) == 64
+        assert public_key_from_private(priv) == pub
+
+    def test_public_keys_are_unique(self):
+        store = ValidatorKeyStore(["v1", "v2", "v3", "v4"])
+        pubs = store.public_keys
+        assert len(set(pubs)) == 4
+
+    def test_contains(self):
+        store = ValidatorKeyStore(["v1", "v2"])
+        assert "v1" in store
+        assert "v3" not in store
+
+    def test_unknown_validator_raises(self):
+        store = ValidatorKeyStore(["v1"])
+        with pytest.raises(KeyError):
+            store.private_key("v99")
+
+    def test_sign_vote_as(self):
+        store = ValidatorKeyStore(["v1", "v2", "v3", "v4"])
+        v = Vote(1, 0, Phase.PREVOTE, "bid", "v1")
+        signed = store.sign_vote_as(v, "v1")
+        assert store.verify_vote(signed, "v1")
+
+    def test_sign_block_as(self):
+        store = ValidatorKeyStore(["v1", "v2", "v3", "v4"])
+        pub = store.public_key("v1")
+        b = Block(height=1, round=0, parent_id="p", proposer_id=pub)
+        signed = store.sign_block_as(b, "v1")
+        assert verify_block_id(signed)
+        assert store.verify_block(signed, "v1")
+
+    def test_sign_transaction_as(self):
+        store = ValidatorKeyStore(["v1"])
+        pub = store.public_key("v1")
+        tx = Transaction(sender=pub, receiver="recv", amount=100, nonce=0)
+        signed = store.sign_transaction_as(tx, "v1")
+        assert verify_transaction_signature(signed)
+
+    def test_different_stores_different_keys(self):
+        """Two stores with same names but independently generated keys."""
+        store1 = ValidatorKeyStore(["v1"])
+        store2 = ValidatorKeyStore(["v1"])
+        # Keys are randomly generated, astronomically unlikely to collide
+        assert store1.public_key("v1") != store2.public_key("v1")
+
+    def test_empty_store_raises(self):
+        with pytest.raises(ValueError):
+            ValidatorKeyStore([])
+
+    def test_duplicate_ids_raises(self):
+        with pytest.raises(ValueError):
+            ValidatorKeyStore(["v1", "v1"])
 
 
 # =========================================================================
@@ -239,6 +475,14 @@ class TestWorldState:
         ws2.credit("a", 100)  # different order, same result
         assert ws1.state_root() == ws2.state_root()
 
+    def test_state_root_changes_on_mutation(self):
+        ws = WorldState()
+        ws.credit("a", 100)
+        r1 = ws.state_root()
+        ws.credit("a", 1)
+        r2 = ws.state_root()
+        assert r1 != r2
+
     def test_roundtrip_dict(self):
         ws = WorldState()
         ws.credit("a", 100)
@@ -246,6 +490,12 @@ class TestWorldState:
         ws2 = WorldState.from_dict(ws.to_dict())
         assert ws2.get_balance("a") == 100
         assert ws2.get_nonce("a") == 1
+
+    def test_empty_state_root_stable(self):
+        """Empty world state has a fixed deterministic root."""
+        r1 = WorldState().state_root()
+        r2 = WorldState().state_root()
+        assert r1 == r2
 
 
 class TestGenesisState:
@@ -325,6 +575,17 @@ class TestTransactionExecution:
         assert result.success
         assert state.get_nonce(pub) == 1
 
+    def test_validate_does_not_mutate(self):
+        priv, pub = _make_keypair()
+        _, recv = _make_keypair()
+        state = create_genesis_state({pub: 1000})
+        tx = _make_signed_tx(priv, pub, recv, 100, 0)
+
+        result = validate_transaction(tx, state)
+        assert result.success
+        assert state.get_balance(pub) == 1000  # state must NOT be mutated
+        assert state.get_nonce(pub) == 0
+
 
 class TestBlockExecution:
     def test_valid_block(self):
@@ -382,3 +643,159 @@ class TestBlockExecution:
         valid, post, root_after, _ = execute_block(block, state)
         assert valid
         assert root_after != root_before
+
+    def test_dry_run_does_not_mutate_on_success(self):
+        priv, pub = _make_keypair()
+        _, recv = _make_keypair()
+        state = create_genesis_state({pub: 1000})
+        tx = _make_signed_tx(priv, pub, recv, 100, 0)
+        block = Block(height=1, round=0, parent_id="g",
+                      transactions=(tx,), proposer_id=pub)
+
+        valid, post, root, _ = execute_block(block, state, dry_run=True)
+        assert valid
+        # dry_run still returns a modified post_state (copy)
+        assert post.get_balance(pub) == 900
+        # but original state is unchanged
+        assert state.get_balance(pub) == 1000
+
+
+# =========================================================================
+# Block validation tests (TV2 §4.1 requirements)
+# =========================================================================
+
+class TestBlockValidation:
+    """Test validate_block — the pre-vote gating check."""
+
+    def _setup(self):
+        priv, pub = generate_keypair()
+        state = create_genesis_state({pub: 1000})
+        return priv, pub, state
+
+    def _make_valid_block(self, priv, pub, state, parent_id="genesis",
+                          height=1, round_=0):
+        """Build and sign a valid block with correct state_root."""
+        b = Block(
+            height=height, round=round_, parent_id=parent_id,
+            proposer_id=pub, timestamp=0.0,
+        )
+        # Compute state_root by dry-running execution
+        _, _, sr, _ = execute_block(b, state, dry_run=True)
+        b2 = Block(
+            height=b.height, round=b.round, parent_id=b.parent_id,
+            transactions=b.transactions, proposer_id=b.proposer_id,
+            timestamp=b.timestamp, state_root=sr,
+        )
+        return sign_block(b2, priv)
+
+    def test_valid_block_passes(self):
+        priv, pub, state = self._setup()
+        block = self._make_valid_block(priv, pub, state)
+        result = validate_block(block, state, "genesis",
+                                proposer_public_key=pub,
+                                require_state_root=True)
+        assert result.valid
+
+    def test_wrong_block_id_fails(self):
+        priv, pub, state = self._setup()
+        import dataclasses
+        block = self._make_valid_block(priv, pub, state)
+        tampered = dataclasses.replace(block, block_id="wrong_id")
+        result = validate_block(tampered, state, "genesis", proposer_public_key=pub)
+        assert not result.valid
+        assert "block_id" in result.error
+
+    def test_wrong_parent_id_fails(self):
+        priv, pub, state = self._setup()
+        block = self._make_valid_block(priv, pub, state, parent_id="genesis")
+        result = validate_block(block, state, "wrong_parent", proposer_public_key=pub)
+        assert not result.valid
+        assert "parent_id" in result.error
+
+    def test_invalid_proposer_signature_fails(self):
+        priv, pub, state = self._setup()
+        _, pub2 = generate_keypair()
+        block = self._make_valid_block(priv, pub, state)
+        # Verify with the wrong public key
+        result = validate_block(block, state, "genesis", proposer_public_key=pub2)
+        assert not result.valid
+        assert "signature" in result.error
+
+    def test_invalid_tx_in_block_fails(self):
+        priv, pub, state = self._setup()
+        _, recv = generate_keypair()
+        # Create a tx with wrong nonce (5 instead of 0)
+        bad_tx = _make_signed_tx(priv, pub, recv, 100, 5)
+        b = Block(height=1, round=0, parent_id="genesis",
+                  transactions=(bad_tx,), proposer_id=pub)
+        _, _, sr, _ = execute_block(b, state, dry_run=True)
+        b2 = Block(height=1, round=0, parent_id="genesis",
+                   transactions=(bad_tx,), proposer_id=pub, state_root="")
+        signed = sign_block(b2, priv)
+        result = validate_block(signed, state, "genesis")
+        assert not result.valid
+        assert "tx[0]" in result.error
+
+    def test_state_root_mismatch_fails(self):
+        priv, pub, state = self._setup()
+        # Build block with wrong state_root
+        b = Block(height=1, round=0, parent_id="genesis",
+                  proposer_id=pub, state_root="wrong_state_root")
+        signed = sign_block(b, priv)
+        result = validate_block(signed, state, "genesis",
+                                proposer_public_key=pub,
+                                require_state_root=True)
+        assert not result.valid
+        assert "state_root" in result.error
+
+    def test_valid_block_with_transactions(self):
+        priv, pub, state = self._setup()
+        _, recv = generate_keypair()
+        tx = _make_signed_tx(priv, pub, recv, 200, 0)
+        b = Block(height=1, round=0, parent_id="genesis",
+                  transactions=(tx,), proposer_id=pub)
+        _, _, sr, _ = execute_block(b, state, dry_run=True)
+        b2 = Block(height=1, round=0, parent_id="genesis",
+                   transactions=(tx,), proposer_id=pub, state_root=sr)
+        signed = sign_block(b2, priv)
+        result = validate_block(signed, state, "genesis",
+                                proposer_public_key=pub,
+                                require_state_root=True)
+        assert result.valid
+        assert result.state_root == sr
+
+    def test_no_signature_check_when_key_not_provided(self):
+        priv, pub, state = self._setup()
+        block = self._make_valid_block(priv, pub, state)
+        # No proposer_public_key → signature is not checked
+        result = validate_block(block, state, "genesis")
+        assert result.valid
+
+    def test_validate_block_returns_computed_state_root(self):
+        priv, pub, state = self._setup()
+        _, recv = generate_keypair()
+        tx = _make_signed_tx(priv, pub, recv, 100, 0)
+        b = Block(height=1, round=0, parent_id="genesis",
+                  transactions=(tx,), proposer_id=pub)
+        signed = sign_block(b, priv)
+        result = validate_block(signed, state, "genesis")
+        assert result.valid
+        # The returned state_root should equal what execute_block produces
+        _, _, expected_root, _ = execute_block(b, state, dry_run=True)
+        assert result.state_root == expected_root
+
+    def test_empty_block_validates(self):
+        priv, pub, state = self._setup()
+        b = Block(height=1, round=0, parent_id="genesis", proposer_id=pub)
+        signed = sign_block(b, priv)
+        result = validate_block(signed, state, "genesis", proposer_public_key=pub)
+        assert result.valid
+
+    def test_duplicate_vote_guard_independent_of_validate_block(self):
+        """validate_block is stateless — calling it twice is idempotent."""
+        priv, pub, state = self._setup()
+        block = self._make_valid_block(priv, pub, state)
+        r1 = validate_block(block, state, "genesis", proposer_public_key=pub)
+        r2 = validate_block(block, state, "genesis", proposer_public_key=pub)
+        assert r1.valid and r2.valid
+        assert r1.state_root == r2.state_root

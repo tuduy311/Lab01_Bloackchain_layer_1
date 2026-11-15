@@ -10,6 +10,10 @@ Design notes
   and signature verification (JSON with sorted keys, UTF-8 encoded).
 * ``block_id`` is always the SHA-256 hex digest of the block's canonical bytes
   (excluding the ``block_id`` field itself).
+* ``state_root`` in Block is the SHA-256 of the world state **after** applying
+  all transactions.  It is set by the execution engine and included in the
+  canonical hash so two blocks with the same transactions but different
+  pre-states get different ids.
 """
 
 from __future__ import annotations
@@ -17,7 +21,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, FrozenSet, List, Optional, Tuple
 
 
 # ---------------------------------------------------------------------------
@@ -148,6 +152,7 @@ class Block:
     transactions: tuple = ()          # tuple[Transaction, ...]
     proposer_id: str = ""
     timestamp: float = 0.0
+    state_root: str = ""   # SHA-256 of world state after executing this block's txs
     block_id: str = ""
     signature: str = ""
 
@@ -162,6 +167,7 @@ class Block:
             "transactions": [tx.to_dict() for tx in self.transactions],
             "proposer_id": self.proposer_id,
             "timestamp": self.timestamp,
+            "state_root": self.state_root,
         }
 
     def canonical_bytes(self) -> bytes:
@@ -184,6 +190,7 @@ class Block:
             transactions=txs,
             proposer_id=d.get("proposer_id", ""),
             timestamp=float(d.get("timestamp", 0.0)),
+            state_root=d.get("state_root", ""),
             block_id=d.get("block_id", ""),
             signature=d.get("signature", ""),
         )
@@ -370,6 +377,116 @@ def genesis_block() -> Block:
         transactions=blk.transactions,
         proposer_id=blk.proposer_id,
         timestamp=blk.timestamp,
+        state_root=blk.state_root,
         block_id=bid,
         signature="",
     )
+
+
+# ---------------------------------------------------------------------------
+# ValidatorSet — ordered, immutable set of validator public-key ids
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class ValidatorSet:
+    """An ordered, immutable set of validator identifiers.
+
+    Parameters
+    ----------
+    validators : tuple[str, ...]
+        Ordered tuple of validator ids (public-key hex strings or symbolic
+        names for simulations).
+    f : int
+        Maximum number of Byzantine validators.  ``len(validators) >= 3*f+1``
+        is enforced at construction.
+    """
+    validators: tuple       # tuple[str, ...]
+    f: int = 0
+
+    def __post_init__(self) -> None:
+        vals = tuple(self.validators)
+        if not vals:
+            raise ValueError("ValidatorSet requires at least one validator")
+        if len(set(vals)) != len(vals):
+            raise ValueError("ValidatorSet: validator ids must be unique")
+        f = self.f
+        if f < 0:
+            raise ValueError("f must be >= 0")
+        if len(vals) < 3 * f + 1:
+            raise ValueError(
+                f"ValidatorSet: need n >= 3f+1, got n={len(vals)}, f={f}"
+            )
+        object.__setattr__(self, "validators", vals)
+
+    @property
+    def n(self) -> int:
+        """Total number of validators."""
+        return len(self.validators)
+
+    @property
+    def quorum(self) -> int:
+        """Minimum vote count for a quorum: ``2f + 1``."""
+        return 2 * self.f + 1
+
+    def __contains__(self, validator_id: str) -> bool:
+        return validator_id in self.validators
+
+    def __len__(self) -> int:
+        return len(self.validators)
+
+    def __iter__(self):
+        return iter(self.validators)
+
+    @classmethod
+    def from_public_keys(cls, public_keys: List[str], f: Optional[int] = None) -> "ValidatorSet":
+        """Build from a list of Ed25519 public key hex strings.
+
+        If *f* is omitted it is derived as ``(n - 1) // 3``.
+        """
+        n = len(public_keys)
+        if f is None:
+            f = (n - 1) // 3
+        return cls(tuple(public_keys), f)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {"validators": list(self.validators), "f": self.f}
+
+    @classmethod
+    def from_dict(cls, d: Dict[str, Any]) -> "ValidatorSet":
+        return cls(tuple(d["validators"]), int(d["f"]))
+
+
+# ---------------------------------------------------------------------------
+# Polka — a quorum of prevotes for one block / round
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class Polka:
+    """A quorum of prevotes witnessing that ``block_id`` received ``QUORUM``
+    prevotes in ``(height, round)``.
+
+    This model mirrors :class:`src.consensus.locking.Polka` but lives in
+    *models* so it can be attached to network messages without circular
+    imports between ``models`` ↔ ``consensus``.
+    """
+    height: int
+    round: int
+    block_id: str
+    votes: tuple    # tuple[Vote, ...]
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "height": self.height,
+            "round": self.round,
+            "block_id": self.block_id,
+            "votes": [v.to_dict() for v in self.votes],
+        }
+
+    @classmethod
+    def from_dict(cls, d: Dict[str, Any]) -> "Polka":
+        return cls(
+            height=int(d["height"]),
+            round=int(d["round"]),
+            block_id=d["block_id"],
+            votes=tuple(Vote.from_dict(v) for v in d.get("votes", [])),
+        )

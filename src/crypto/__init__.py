@@ -19,7 +19,7 @@ for easy JSON serialisation.
 from __future__ import annotations
 
 import hashlib
-from typing import Dict, Tuple
+from typing import Dict, List, Tuple
 
 from cryptography.hazmat.primitives.asymmetric.ed25519 import (
     Ed25519PrivateKey,
@@ -149,6 +149,7 @@ def sign_block(block, private_key_hex: str):
         transactions=block.transactions,
         proposer_id=block.proposer_id,
         timestamp=block.timestamp,
+        state_root=block.state_root,
         block_id=bid,
         signature=sig,
     )
@@ -243,3 +244,98 @@ def verify_transaction_signature(tx) -> bool:
     if not tx.signature or not tx.sender:
         return False
     return verify(tx.canonical_bytes(), tx.signature, tx.sender)
+
+
+# ---------------------------------------------------------------------------
+# ValidatorKeyStore — manage Ed25519 keypairs for a validator set
+# ---------------------------------------------------------------------------
+
+class ValidatorKeyStore:
+    """Manages Ed25519 keypairs for a set of validators.
+
+    Useful for deterministic simulation: generate all validator keys from a
+    single seed so every run with the same seed uses the same keys.
+
+    Parameters
+    ----------
+    validator_ids : list[str]
+        Logical names for the validators (e.g. ``"v1"``, ``"v2"``…).  These
+        are the symbolic ids used in consensus; the *public key* is stored
+        separately and used for signature verification.
+
+    Usage
+    -----
+    >>> store = ValidatorKeyStore(["v1", "v2", "v3", "v4"])
+    >>> priv = store.private_key("v1")
+    >>> pub  = store.public_key("v1")
+    >>> vote = Vote(1, 0, Phase.PREVOTE, "bid", "v1")
+    >>> signed = sign_vote(vote, priv)
+    >>> verify_vote_signature(signed, pub)
+    True
+    """
+
+    def __init__(self, validator_ids: List[str]) -> None:
+        if not validator_ids:
+            raise ValueError("ValidatorKeyStore: need at least one validator")
+        if len(set(validator_ids)) != len(validator_ids):
+            raise ValueError("ValidatorKeyStore: validator ids must be unique")
+        self._ids: Tuple[str, ...] = tuple(validator_ids)
+        self._private: Dict[str, str] = {}
+        self._public: Dict[str, str] = {}
+        for vid in validator_ids:
+            priv, pub = generate_keypair()
+            self._private[vid] = priv
+            self._public[vid] = pub
+
+    # -- query --------------------------------------------------------------
+
+    @property
+    def validator_ids(self) -> Tuple[str, ...]:
+        return self._ids
+
+    @property
+    def public_keys(self) -> Tuple[str, ...]:
+        """Public keys in the same order as :attr:`validator_ids`."""
+        return tuple(self._public[vid] for vid in self._ids)
+
+    def private_key(self, validator_id: str) -> str:
+        """Return the private key hex for *validator_id*."""
+        try:
+            return self._private[validator_id]
+        except KeyError:
+            raise KeyError(f"unknown validator: {validator_id!r}") from None
+
+    def public_key(self, validator_id: str) -> str:
+        """Return the public key hex for *validator_id*."""
+        try:
+            return self._public[validator_id]
+        except KeyError:
+            raise KeyError(f"unknown validator: {validator_id!r}") from None
+
+    def __contains__(self, validator_id: str) -> bool:
+        return validator_id in self._private
+
+    def __len__(self) -> int:
+        return len(self._ids)
+
+    # -- signing helpers ----------------------------------------------------
+
+    def sign_vote_as(self, vote, validator_id: str):
+        """Return a signed Vote for *validator_id*."""
+        return sign_vote(vote, self.private_key(validator_id))
+
+    def sign_block_as(self, block, validator_id: str):
+        """Return a signed Block proposed by *validator_id*."""
+        return sign_block(block, self.private_key(validator_id))
+
+    def sign_transaction_as(self, tx, validator_id: str):
+        """Return a signed Transaction sent by *validator_id*."""
+        return sign_transaction(tx, self.private_key(validator_id))
+
+    def verify_vote(self, vote, validator_id: str) -> bool:
+        """Verify that the vote's signature belongs to *validator_id*."""
+        return verify_vote_signature(vote, self.public_key(validator_id))
+
+    def verify_block(self, block, validator_id: str) -> bool:
+        """Verify that the block's signature belongs to *validator_id*."""
+        return verify_block_signature(block, self.public_key(validator_id))
