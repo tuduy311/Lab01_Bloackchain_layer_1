@@ -49,6 +49,8 @@ class ConsensusEngine:
         proposer_selector: Optional[ProposerSelector] = None,
         require_signatures: bool = False,
         block_validator: Optional[Callable[[Block], bool]] = None,
+        public_key_resolver: Optional[Callable[[str], str]] = None,
+        vote_signer: Optional[Callable[[Vote], Vote]] = None,
     ) -> None:
         self.node_id = node_id
         self.validators = tuple(validators)
@@ -58,14 +60,12 @@ class ConsensusEngine:
             raise ValueError("node_id must belong to validators")
         if height < 0:
             raise ValueError("height must be >= 0")
-        self.quorum = (
-            2 * (len(self.validators) // 3) + 1
-            if len(self.validators) >= 4
-            else len(self.validators)
-        )
+        self.quorum = len(self.validators) - (len(self.validators) - 1) // 3
         self.selector = proposer_selector or ProposerSelector(self.validators)
         self.require_signatures = require_signatures
         self.block_validator = block_validator
+        self.public_key_resolver = public_key_resolver or (lambda validator: validator)
+        self.vote_signer = vote_signer or (lambda vote: vote)
         self.parent_id = parent_id
         self.state = ConsensusState(height=height)
         self.lock = LockState()
@@ -105,22 +105,48 @@ class ConsensusEngine:
 
     # -- proposal and local votes ----------------------------------------
 
-    def accept_proposal(self, block: Block) -> bool:
-        """Validate and retain a proposal for the current height/round."""
-        if block.height != self.height or block.round != self.round:
+    def accept_proposal(
+        self, block: Block, *, proposal_round: Optional[int] = None,
+        proposer_id: Optional[str] = None, valid_round_polka: Optional[Polka] = None,
+    ) -> bool:
+        """Accept a block, including an unchanged block re-proposed later.
+
+        The transport must authenticate the *current* proposal envelope. The
+        block's original signature and any previous-round proof are checked
+        here. Block.round remains its creation round, preserving its hash.
+        """
+        round_ = block.round if proposal_round is None else proposal_round
+        proposer = block.proposer_id if proposer_id is None else proposer_id
+        if block.height != self.height or round_ != self.round:
+            return False
+        if block.round < 0 or block.round > round_:
+            return False
+        if self.selector.proposer_for(block.height, round_) != proposer:
             return False
         if self.selector.proposer_for(block.height, block.round) != block.proposer_id:
             return False
         if block.parent_id != self.parent_id or not verify_block_id(block):
             return False
         if self.require_signatures and not verify_block_signature(
-            block, block.proposer_id
+            block, self.public_key_resolver(block.proposer_id)
         ):
             return False
         if self.block_validator is not None and not self.block_validator(block):
             return False
-        if not self.lock.can_prevote(block.block_id, block.round):
+        if block.round < round_ and valid_round_polka is None:
             return False
+        if valid_round_polka is not None:
+            if (
+                not self.verify_polka(valid_round_polka)
+                or valid_round_polka.height != self.height
+                or valid_round_polka.block_id != block.block_id
+                or not block.round <= valid_round_polka.round < round_
+            ):
+                return False
+        if not self.lock.can_prevote(block.block_id, round_, valid_round_polka):
+            return False
+        if valid_round_polka is not None:
+            self.polkas[(self.height, valid_round_polka.round, block.block_id)] = valid_round_polka
         self.blocks[block.block_id] = block
         self.state.phase = Phase.PREVOTE
         return True
@@ -133,10 +159,16 @@ class ConsensusEngine:
         if self.state.phase not in (Phase.PROPOSAL, Phase.PREVOTE):
             raise ValueError("cannot prevote after leaving the prevote phase")
         candidate = block_id or self.lock.locked_block_id or NIL_BLOCK_ID
-        polka = self.polkas.get((self.height, self.round, candidate))
+        if candidate != NIL_BLOCK_ID and (
+            candidate not in self.blocks or self.blocks[candidate].height != self.height
+        ):
+            raise ValueError("cannot prevote an unknown block")
+        proofs = [p for p in self.polkas.values()
+                  if p.height == self.height and p.block_id == candidate and p.round <= self.round]
+        polka = max(proofs, key=lambda p: p.round, default=None)
         if not self.lock.can_prevote(candidate, self.round, polka):
             candidate = self.lock.locked_block_id or NIL_BLOCK_ID
-        vote = Vote(self.height, self.round, Phase.PREVOTE, candidate, self.node_id)
+        vote = self.vote_signer(Vote(self.height, self.round, Phase.PREVOTE, candidate, self.node_id))
         if not self.votes.add(vote):
             raise ValueError("validator already prevoted this height and round")
         self.state.phase = Phase.PREVOTE
@@ -149,7 +181,7 @@ class ConsensusEngine:
             (self.height, self.round, candidate) not in self.polkas
         ):
             raise ValueError("precommit requires a quorum prevote polka")
-        vote = Vote(self.height, self.round, Phase.PRECOMMIT, candidate, self.node_id)
+        vote = self.vote_signer(Vote(self.height, self.round, Phase.PRECOMMIT, candidate, self.node_id))
         if not self.votes.add(vote):
             raise ValueError("validator already precommitted this height and round")
         self.state.phase = Phase.PRECOMMIT
@@ -168,7 +200,9 @@ class ConsensusEngine:
             return None
         if vote.voter_id not in self.validators:
             return None
-        if self.require_signatures and not verify_vote_signature(vote, vote.voter_id):
+        if self.require_signatures and not verify_vote_signature(
+            vote, self.public_key_resolver(vote.voter_id)
+        ):
             return None
         if not self.votes.add(vote):
             return None
@@ -181,7 +215,8 @@ class ConsensusEngine:
     handle_vote = receive_vote
 
     def _on_prevote(self, vote: Vote) -> Optional[Vote]:
-        if vote.block_id == NIL_BLOCK_ID:
+        if (vote.block_id == NIL_BLOCK_ID or vote.block_id not in self.blocks
+                or self.blocks[vote.block_id].height != vote.height):
             return None
         if self.votes.count(
             vote.height, vote.round, Phase.PREVOTE, vote.block_id
@@ -197,11 +232,15 @@ class ConsensusEngine:
         self.state.phase = Phase.PRECOMMIT
         if self.node_id not in {item.voter_id for item in votes}:
             return None
+        if self.votes.has(self.height, self.round, Phase.PRECOMMIT, self.node_id):
+            return None
         return self.make_precommit(vote.block_id)
 
     def _on_precommit(self, vote: Vote) -> Optional[FinalizeCertificate]:
         if vote.block_id != NIL_BLOCK_ID and (
             (vote.height, vote.round, vote.block_id) not in self.polkas
+            or vote.block_id not in self.blocks
+            or self.blocks[vote.block_id].height != vote.height
         ):
             return None
         if self.votes.count(
@@ -223,6 +262,77 @@ class ConsensusEngine:
         self.state.phase = Phase.FINALIZE
         self._advance_height(certificate)
         return certificate
+
+    def poll(self) -> Tuple[object, ...]:
+        """Evaluate stored votes after a local vote or reordered delivery.
+
+        Local votes are already in VoteGuard, so feeding them back through
+        receive_vote would only hit deduplication. This method never re-signs
+        or re-broadcasts a vote and may return a precommit and certificate.
+        """
+        actions = []
+        slot = (self.height, self.round)
+        for vote in self.votes.votes(*slot, Phase.PREVOTE):
+            action = self._on_prevote(vote)
+            if action is not None:
+                actions.append(action)
+        for vote in self.votes.votes(*slot, Phase.PRECOMMIT):
+            action = self._on_precommit(vote)
+            if action is not None:
+                actions.append(action)
+            if (self.height, self.round) != slot:
+                break
+        return tuple(actions)
+
+    def _verify_quorum(self, votes, height: int, round_: int, phase: Phase, block_id: str) -> bool:
+        if height < 0 or round_ < 0 or not block_id or block_id == NIL_BLOCK_ID:
+            return False
+        seen = set()
+        for vote in votes:
+            if (vote.voter_id in seen or vote.voter_id not in self.validators
+                    or (vote.height, vote.round, vote.phase, vote.block_id)
+                    != (height, round_, phase, block_id)):
+                return False
+            if self.require_signatures and not verify_vote_signature(
+                vote, self.public_key_resolver(vote.voter_id)
+            ):
+                return False
+            seen.add(vote.voter_id)
+        return len(seen) >= self.quorum
+
+    def verify_polka(self, polka: Polka) -> bool:
+        return self._verify_quorum(
+            polka.votes, polka.height, polka.round, Phase.PREVOTE, polka.block_id
+        )
+
+    def verify_certificate(self, certificate: FinalizeCertificate) -> bool:
+        """A signed precommit quorum can be verified without local vote history."""
+        return self._verify_quorum(
+            certificate.precommits, certificate.height, certificate.round,
+            Phase.PRECOMMIT, certificate.block_id,
+        )
+
+    def accept_finalize(self, block: Block, certificate: FinalizeCertificate) -> bool:
+        """Catch up one height from a fully verified block and certificate."""
+        if (block.height != self.height or certificate.height != self.height
+                or block.block_id != certificate.block_id
+                or not 0 <= block.round <= certificate.round
+                or block.parent_id != self.parent_id
+                or block.proposer_id != self.selector.proposer_for(block.height, block.round)
+                or not verify_block_id(block) or not self.verify_certificate(certificate)):
+            return False
+        if self.require_signatures and not verify_block_signature(
+            block, self.public_key_resolver(block.proposer_id)
+        ):
+            return False
+        if self.block_validator is not None and not self.block_validator(block):
+            return False
+        if block.height in self.finalized:
+            return False
+        self.blocks[block.block_id] = block
+        self.finalized[block.height] = certificate
+        self._advance_height(certificate)
+        return True
 
     def _advance_height(self, certificate: FinalizeCertificate) -> None:
         block = self.blocks.get(certificate.block_id)

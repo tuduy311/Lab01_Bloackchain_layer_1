@@ -260,8 +260,8 @@ class TestProposerSelector:
         for ring in rings:
             assert set(ring) == set(self.validators)
 
-    @pytest.mark.parametrize("size,expected", [(4, 3), (7, 5), (8, 5), (10, 7)])
-    def test_quorum_matches_2f_1(self, size, expected):
+    @pytest.mark.parametrize("size,expected", [(4, 3), (7, 5), (8, 6), (10, 7)])
+    def test_quorum_matches_n_minus_f(self, size, expected):
         selector = ProposerSelector(tuple(f"v{i}" for i in range(size)))
         assert selector.quorum == expected
 
