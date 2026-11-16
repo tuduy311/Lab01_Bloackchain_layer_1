@@ -23,7 +23,8 @@ htmlcov/
 .idea/
 
 # Generated files
-logs/
+logs/*
+!logs/README.md
 outputs/
 *.log
 

@@ -1,0 +1,12 @@
+{
+  "chain_id": "lab01-demo",
+  "num_nodes": 8,
+  "seed": 42,
+  "target_height": 2,
+  "prestart_gossip": false,
+  "max_events": 50000,
+  "demo_transfer": true,
+  "demo_amount": 25,
+  "network": {"min_delay": 0.005, "max_delay": 0.025, "drop_rate": 0.0, "duplicate_rate": 0.5, "stabilize_at": 1.0, "rate_limit": {"capacity": 512, "refill_per_second": 512.0, "inbound_capacity": 512}},
+  "timeout": {"base": 0.4, "multiplier": 1.6, "max_timeout": 5.0, "seed": 42}
+}

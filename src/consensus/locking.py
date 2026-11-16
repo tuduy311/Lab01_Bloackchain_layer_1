@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Iterable, Optional, Set, Tuple
+from typing import Optional, Tuple
 
-from src.models import NIL_BLOCK_ID, Phase, Vote
+from src.models import NIL_BLOCK_ID, Vote
+from src.consensus.vote_pool import VotePool, VoteKey
 
 
-VoteKey = Tuple[int, int, Phase, str]
 Slot = Tuple[int, int]
 
 
@@ -81,54 +81,6 @@ class LockState:
         self.valid_round = None
 
 
-class VoteGuard:
-    """Deduplicate votes and enforce one vote per validator and phase."""
-
-    def __init__(self, validators: Iterable[str]) -> None:
-        self.validators: Set[str] = set(validators)
-        self._votes: Dict[VoteKey, Vote] = {}
-        self.conflicts: list[Tuple[Vote, Vote]] = []
-
-    def add(self, vote: Vote) -> bool:
-        """Store ``vote`` once; return ``False`` for duplicate/conflict."""
-        if vote.voter_id not in self.validators:
-            return False
-        key = (vote.height, vote.round, vote.phase, vote.voter_id)
-        previous = self._votes.get(key)
-        if previous is not None:
-            if previous.block_id != vote.block_id:
-                self.conflicts.append((previous, vote))
-            return False
-        self._votes[key] = vote
-        return True
-
-    def votes(
-        self,
-        height: int,
-        round: int,
-        phase: Phase,
-        block_id: Optional[str] = None,
-    ) -> Tuple[Vote, ...]:
-        values = tuple(
-            vote for key, vote in self._votes.items()
-            if key[:3] == (height, round, phase)
-            and (block_id is None or vote.block_id == block_id)
-        )
-        return tuple(sorted(values, key=lambda vote: vote.voter_id))
-
-    def count(
-        self,
-        height: int,
-        round: int,
-        phase: Phase,
-        block_id: str,
-    ) -> int:
-        return len(self.votes(height, round, phase, block_id))
-
-    def has(self, height: int, round: int, phase: Phase, voter_id: str) -> bool:
-        return (height, round, phase, voter_id) in self._votes
-
-    def clear_before(self, height: int) -> None:
-        self._votes = {
-            key: vote for key, vote in self._votes.items() if key[0] >= height
-        }
+# Compatibility alias: vote storage now lives in vote_pool.py as its own team
+# responsibility, while older imports from locking.py continue to work.
+VoteGuard = VotePool

@@ -260,7 +260,7 @@ class TestProposerSelector:
         for ring in rings:
             assert set(ring) == set(self.validators)
 
-    @pytest.mark.parametrize("size,expected", [(4, 3), (7, 5), (8, 5), (10, 7)])
+    @pytest.mark.parametrize("size,expected", [(4, 3), (7, 5), (8, 6), (10, 7)])
     def test_quorum_matches_2f_1(self, size, expected):
         selector = ProposerSelector(tuple(f"v{i}" for i in range(size)))
         assert selector.quorum == expected
@@ -481,6 +481,13 @@ class TestNetworkConfig:
 # =========================================================================
 
 class TestNetworkTransport:
+    def test_nonzero_packet_delay_has_an_explicit_log_event(self):
+        sched, net, _inbox = make_network(min_delay=0.2, max_delay=0.2)
+        net.send("node_1", "node_2", "delayed")
+        delay_events = events_of(net, NetworkEventType.DELAY)
+        assert len(delay_events) == 1
+        assert delay_events[0].delay == pytest.approx(0.2)
+
     def test_message_is_delivered_after_delay(self):
         sched, net, inbox = make_network(min_delay=0.02, max_delay=0.04)
         assert net.send("node_1", "node_2", "hello", kind="PREVOTE", height=3) is SendStatus.QUEUED

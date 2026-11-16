@@ -82,8 +82,14 @@ class ProposerSelector:
 
     @property
     def quorum(self) -> int:
-        """``2f + 1`` for ``n = 3f + 1`` (rounded down for other sizes)."""
-        return 2 * (self.size // 3) + 1 if self.size >= 4 else self.size
+        """Safe quorum ``n-f`` for ``f=floor((n-1)/3)``.
+
+        For n=3f+1 this is 2f+1.  The stronger value also keeps the
+        intersection property when a lab topology has a non-3f+1 size (e.g.
+        eight validators).
+        """
+        faults = (self.size - 1) // 3
+        return self.size - faults
 
     @property
     def engine_order(self) -> Tuple[str, ...]:

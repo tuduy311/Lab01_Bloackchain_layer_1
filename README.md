@@ -1,185 +1,117 @@
-# LAB 01 - Mô phỏng Blockchain Layer 1
+# Lab 01 - Blockchain Layer 1 Simulator
 
-## 1. Giới thiệu
+## Mục tiêu
 
-Đây là bài thực hành xây dựng một blockchain Layer 1 tối giản có khả năng
-đạt đồng thuận và hoàn tất block trong môi trường mạng không ổn định.
+Mô phỏng blockchain tài khoản với nhiều validator độc lập. Mỗi node giữ ledger,
+state và mempool riêng; node chỉ trao đổi proposal, vote, transaction và
+certificate qua mạng sự kiện. Mạng hỗ trợ trễ, mất, đảo thứ tự, gửi trùng, giới
+hạn tốc độ và chuyển sang đồng bộ sau `stabilize_at`.
 
-Mục tiêu của hệ thống:
-
-- Các node xác thực cùng hội tụ về một chuỗi block đã hoàn tất.
-- Không có hai block khác nhau cùng height được hoàn tất.
-- Giao dịch được xác thực chữ ký và thực thi trạng thái một cách xác định.
-- Hệ thống vẫn đảm bảo an toàn khi thông điệp bị trễ, mất, trùng hoặc đảo thứ tự.
-- Kết quả chạy lại cùng cấu hình và seed phải có log giống hệt nhau.
-
-Mô hình giả định có `n = 3f + 1` validator và nhiều nhất `f` validator
-Byzantine. Mạng có thể không ổn định trước thời điểm đồng bộ; sau đó thông
-điệp giữa các node đúng được phân phối trong một khoảng thời gian giới hạn.
-
-## 2. Thành viên
-- TV1: Consensus
-- TV2: Models, Cryptography, Execution
-- TV3: Network, Scheduler, Proposer, Timeout
-- TV4: Integration and Testing
-- TV5: Logging, Monitoring, Replay
-
-## 3. Cấu trúc dự án
+## Cấu trúc
 
 ```text
-Lab01_Bloackchain_layer_1/
-├── src/
-│   ├── consensus/              # Cơ chế đồng thuận BFT
-│   │   ├── engine.py           # Máy trạng thái consensus
-│   │   └── locking.py          # Quy tắc locking/unlocking
-│   ├── models/                 # Block, Vote, Transaction, Message
-│   ├── crypto/                 # Chữ ký, hash, canonical encoding
-│   ├── execution/              # State và thực thi giao dịch
-│   ├── network/                # Mạng mô phỏng
-│   ├── node.py                 # Node tích hợp các module
-│   └── blockchain_simulator.py # Điểm chạy mô phỏng
-├── tests/                      # Unit test và end-to-end test
-├── scenarios/                  # Các kịch bản lỗi và Byzantine
-├── config/                     # Cấu hình số node, seed, timeout
-├── logs/                       # Log sinh ra khi chạy
-├── scripts/                    # Script kiểm tra tính xác định
-├── main.py                     # Entry point duy nhất
-├── README.md
-└── REPORT.pdf
+src/
+  blockchain_simulator.py  cấu hình và vòng chạy mô phỏng
+  node.py                  node validator, ledger, mempool, message handler
+  logger.py                log JSONL ổn định
+  scheduler.py             bộ lập lịch sự kiện giả lập
+  models/                  block, transaction, vote, certificate
+  crypto/                  SHA-256, Ed25519 và domain separation
+  execution/               account state, kiểm tra và áp dụng giao dịch
+  consensus/               proposer, lock, quorum, timeout và state machine
+    vote_pool.py           vote storage, loại trùng và ghi nhận equivocation
+  network/                 vận chuyển, fault injection, rate limit, header/body
+  logger.py                log JSONL ổn định
+tests/                     unit test và T1-T8 end-to-end
+config/                    cấu hình mặc định
+scenarios/                 cấu hình tái lập cho T1-T8
+scripts/deterministic_check.py
+main.py                    entry point duy nhất
+logs/                      log và snapshot sinh ra khi chạy
 ```
 
-## 4. Đặc tả Consensus State Machine (TV1, TV2, TV4)
+## Thiết kế chính
 
-### 4.1. Tham số và thuật ngữ
+- Giao dịch là chuyển số dư có chữ ký của sender, nonce tuần tự và domain
+  `TX:<chain_id>`.
+- Block ID cam kết `chain_id`, height, parent, thứ tự giao dịch và state root.
+  Header được ký trong domain `HEADER:<chain_id>`; round và proposer được ký
+  riêng để cùng một giá trị block có thể được đề xuất lại ở round sau.
+- Vote ký height, round, phase, block ID, voter và chain trong domain
+  `VOTE:<chain_id>`. Vote trùng không tăng quorum; vote xung đột của cùng
+  validator được ghi nhận nhưng chỉ vote đầu tiên được tính.
+- Node chỉ lock khi có quorum prevote. Muốn đổi lock, proposal phải mang polka
+  hợp lệ ở round cao hơn. Finalize certificate chứa cả quorum prevote và
+  precommit để node khác xác minh độc lập.
+- Với `f = floor((n-1)/3)`, quorum dùng `n-f`. Khi `n=3f+1`, giá trị này bằng
+  `2f+1`; cách tính này cũng giữ giao quorum an toàn cho topology 8 node.
+- Proposal dùng handshake header trước body. Receiver kiểm tra header, chấp
+  nhận header rồi mới yêu cầu body.
+- Scheduler dùng tick nguyên nanosecond; RNG mạng và leader ring được tách
+  stream theo seed. Log JSONL dùng encoding ổn định để so sánh byte-for-byte.
 
-Consensus được chạy độc lập cho từng `height` và theo các `round` bắt đầu từ
-`0`. Với `n = 3f + 1` validator, quorum là:
+## Cài đặt và chạy
 
-```text
-QUORUM = 2f + 1
+Yêu cầu Python 3.10 trở lên.
+
+```powershell
+py -m venv .venv
+.\.venv\Scripts\Activate.ps1
+py -m pip install -r requirements.txt
 ```
 
-`nil` là một giá trị vote hợp lệ để báo rằng node không chấp nhận proposal.
-`block_id` là hash xác định duy nhất của block (bao gồm `height`, `round`,
-`parent_id`, giao dịch và metadata đã canonicalize). Mọi chữ ký phải được
-kiểm tra trên payload gồm `height`, `round`, `phase`, `block_id` và `voter_id`.
+Chạy cấu hình mặc định. Kết quả được ghi vào `logs/run.jsonl` và
+`logs/blockchain.json`:
 
-Trạng thái tối thiểu của một node:
-
-```text
-height, round
-phase ∈ {PROPOSAL, PREVOTE, PRECOMMIT, FINALIZE}
-locked_block_id ∈ {block_id, nil}
-locked_round ∈ {integer, nil}
-valid_block_id ∈ {block_id, nil}
+```powershell
+py main.py --config config/default.json
 ```
 
-`locked_block_id` không được tự ý thay đổi hoặc xóa trong cùng một height.
-`valid_block_id` là block đã có chứng cứ `QUORUM` prevote và có thể dùng để
-chọn proposal ở round tiếp theo.
+Chạy một kịch bản và đặt tên riêng cho đầu ra:
 
-### 4.2. Flow Proposal -> Prevote -> Precommit -> Finalize
-
-Mỗi bước chỉ chuyển tiếp trong cùng `height` và `round`; message đến height
-khác phải bị loại trước khi xử lý.
-
-1. **Proposal**
-   - Proposer được xác định deterministic từ `(height, round)`.
-   - Proposer gửi một block hợp lệ, kèm `parent_id`, `block_id` và chữ ký.
-   - Node nhận proposal chỉ chấp nhận khi đúng proposer, đúng height/round,
-     parent khớp chain local, chữ ký đúng, giao dịch thực thi hợp lệ và
-     `block_id` khớp nội dung.
-   - Proposal sai hoặc timeout được xử lý như proposal `nil`; không được
-     prevote cho block không hợp lệ.
-
-2. **Prevote**
-   - Node gửi **tối đa một** prevote cho `(height, round)`.
-   - Nếu proposal hợp lệ và không vi phạm locking rule thì prevote
-     `block_id`; ngược lại prevote `nil`.
-   - Node đang lock `L` chỉ được prevote `L`, hoặc một block khác `B` khi có
-     proof `QUORUM` prevote cho `B` ở round cao hơn `locked_round` (proof of
-     valid round). Không có proof thì phải prevote `L`.
-   - Nhận đủ `QUORUM` prevote cho cùng một block `B` tạo `polka(B, round)`.
-
-3. **Precommit**
-   - Node chỉ gửi **tối đa một** precommit cho `(height, round)`.
-   - Khi có `polka(B, round)`, node lock `B` tại `round` và precommit `B`.
-   - Nếu không có polka trước timeout, node precommit `nil` (hoặc chuyển round
-     theo cơ chế timeout của scheduler); không được precommit một block chỉ
-     vì đã thấy proposal.
-   - Precommit cho `B` phải kèm hoặc truy xuất được `polka(B, round)`.
-
-4. **Finalize**
-   - Block `B` chỉ được finalize khi có `QUORUM` precommit hợp lệ cho cùng
-     `(height, round, B)`.
-   - Node ghi `B` vào chain, áp dụng state transition đúng một lần, phát
-     `Finalize(height, block_id, certificate)` và chuyển sang
-     `height + 1`, `round = 0`, `phase = PROPOSAL`.
-   - Sau finalize, mọi proposal/vote của height cũ bị loại. Không finalize
-     block khác nếu height đó đã finalized.
-
-Luồng tóm tắt:
-
-```text
-PROPOSAL
-   | proposal hợp lệ + không vi phạm lock
-   v
-PREVOTE -- QUORUM prevote (polka) --> PRECOMMIT
-   | timeout / không đủ polka              |
-   +--------------> round tiếp theo <-----+
-                         |
-              QUORUM precommit cho B
-                         v
-                     FINALIZE
+```powershell
+py main.py --config scenarios/T5_pre_synchrony_faults.json `
+  --log logs/T5.jsonl --state logs/T5_blockchain.json
 ```
 
-### 4.3. Lock, unlock và an toàn
+Chạy toàn bộ unit test và end-to-end test qua cùng entry point:
 
-- **Lock:** chỉ lock khi node quan sát `QUORUM` prevote cho một block. Khi
-  lock `B`, ghi cả `locked_block_id = B` và `locked_round`.
-- **Giữ lock:** ở các round sau, node tiếp tục prevote `B` nếu không có proof
-  hợp lệ cho block khác.
-- **Unlock:** chỉ unlock/chuyển từ `B` sang `C` khi có `polka(C, r_new)` với
-  `r_new > locked_round`. Việc nhận proposal mới, timeout, hoặc thấy một
-  precommit đơn lẻ không đủ điều kiện unlock.
-- **Nil không mở lock:** prevote/precommit `nil` không tạo lock và không xóa
-  lock hiện tại.
-- **Safety:** hai block khác nhau cùng height không thể cùng có quorum
-  precommit, vì hai quorum `2f + 1` giao nhau ở ít nhất `f + 1` validator,
-  trong đó phải có ít nhất một validator đúng; validator đúng không vote
-  xung đột và tuân thủ lock.
-
-### 4.4. Duplicate guard và điều kiện loại message
-
-Mỗi vote được deduplicate bằng khóa:
-
-```text
-(height, round, phase, voter_id)
+```powershell
+py main.py --test
 ```
 
-Node phải bỏ qua (và log lý do) khi message:
+Chạy cùng cấu hình hai lần, so sánh byte của log và final state hash:
 
-- trùng khóa trên, kể cả payload khác;
-- voter không thuộc validator set hoặc chữ ký không hợp lệ;
-- `height` đã finalized, `round` không hợp lệ, hoặc phase không đúng;
-- `block_id` không khớp nội dung/proof;
-- precommit không có `polka` tương ứng;
-- vote nil có payload block/proof không hợp lệ.
+```powershell
+py main.py --config scenarios/T8_replay.json --check-determinism
+```
 
-Vote trùng không được tăng counter, tạo lại lock, phát lại event hoặc áp dụng
-state transition. Các map counter phải đếm theo `voter_id`, không đếm theo số
-message nhận được. Conflicting vote của cùng một voter được ghi nhận là
-vi phạm Byzantine nhưng vẫn chỉ tính tối đa một vote trong mỗi chứng cứ.
+Có thể gọi riêng bộ kiểm tra tái lập:
 
-### 4.5. Hợp đồng kiểm thử tối thiểu
+```powershell
+py scripts/deterministic_check.py --config scenarios/T8_replay.json
+```
 
-TV4 cần kiểm tra ít nhất các trường hợp sau:
+Exit code `0` nghĩa là mô phỏng hội tụ và an toàn theo các kiểm tra của chương
+trình; exit code `2` nghĩa là chưa hội tụ hoặc phát hiện xung đột finalize.
 
-- proposal hợp lệ đi đủ bốn phase và finalize đúng một lần;
-- proposal sai, timeout và `nil` không tạo lock;
-- node đã lock `B` không prevote `C` nếu thiếu higher-round polka;
-- higher-round polka cho phép unlock/chuyển lock đúng một lần;
-- duplicate và conflicting vote không làm tăng quorum;
-- không finalize với `2f` precommit hoặc precommit thiếu polka;
-- hai block khác nhau cùng height không thể cùng finalize;
-- message cũ/sai height sau finalize không làm thay đổi state.
+## Kịch bản kiểm thử
+
+| ID | Kịch bản | Kết quả được kiểm tra |
+|---|---|---|
+| T1 | Mạng bình thường | Ledger và state root hội tụ |
+| T2 | Message trùng và đảo thứ tự | Không đếm vote hai lần, ledger hội tụ |
+| T3 | Chữ ký sai và sai chain domain | Vote bị từ chối và log lý do |
+| T4 | Gửi lại transaction | Transaction chỉ được áp dụng một lần |
+| T5 | Mất/trễ message trước đồng bộ | Không finalize xung đột, hội tụ sau đồng bộ |
+| T6 | Proposer im lặng | Timeout đổi round, proposer sau tiếp tục |
+| T7 | Proposer Byzantine gửi hai proposal/vote | Không có hai block finalize cùng height |
+| T8 | Chạy lại cùng seed | Log giống từng byte và state hash trùng |
+
+## Khóa của cấu hình demo
+
+Cấu hình mặc định dùng khóa fixture cố định để log và chữ ký có thể tái lập.
+Các khóa này công khai trong mã nguồn và chỉ dành cho simulator; không dùng
+trong hệ thống thật. Có thể truyền `validator_private_keys` và
+`participant_private_keys` trong JSON để thay fixture. Seed của mạng không được
+dùng làm nguồn sinh khóa mật mã.

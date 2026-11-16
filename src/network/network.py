@@ -58,6 +58,7 @@ class NetworkEventType(str, Enum):
     """Types of network events written to the log."""
 
     SEND = "SEND"
+    DELAY = "DELAY"
     DELIVER = "DELIVER"
     DROP = "DROP"
     BLOCK = "BLOCK"
@@ -646,6 +647,12 @@ class Network:
             height=height, envelope_id=envelope_id, header_id=header_id,
             delay=delay, reason="duplicate" if is_duplicate else "",
         )
+        if delay > 0:
+            self._log(
+                NetworkEventType.DELAY, sender_id, recipient_id, kind=kind,
+                height=height, envelope_id=envelope_id, header_id=header_id,
+                delay=delay, reason="duplicate" if is_duplicate else "",
+            )
         self.scheduler.schedule_after(delay, self._deliver, envelope, tag="deliver")
         return envelope
 
