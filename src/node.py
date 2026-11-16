@@ -19,7 +19,7 @@ from src.crypto import (
     public_key_from_private, sha256_hex, sign, sign_block, sign_vote,
     verify, verify_transaction_signature, verify_vote_signature,
 )
-from src.execution import WorldState, apply_transaction, execute_block, validate_block
+from src.execution import BlockValidator, WorldState, apply_transaction, execute_block
 from src.models import (
     Block, FinalizeCertificate, NIL_BLOCK_ID, Phase, Transaction, Vote,
     _canonical_json, genesis_block,
@@ -79,10 +79,14 @@ class Node:
         self.selector = proposer_selector or ProposerSelector(validators)
         if self.selector.validators != validators:
             raise ValueError("proposer selector must use the same ordered validators")
+        self.block_validator = BlockValidator(
+            lambda: self.world_state, public_key_resolver=self.public_keys.__getitem__,
+            proposer_resolver=self.selector.proposer_for, require_state_root=True,
+        )
         self.engine = ConsensusEngine(
-            node_id, validators, parent_id=genesis.block_id,
+            node_id, validators, parent=genesis,
             proposer_selector=self.selector, require_signatures=True,
-            block_validator=self._validate_block,
+            block_validator=self.block_validator,
             public_key_resolver=self.public_keys.__getitem__,
             vote_signer=lambda vote: sign_vote(vote, self.private_key),
         )
@@ -180,19 +184,6 @@ class Node:
         self._log("TX_ADMITTED", tx_id=key)
         return True
 
-    def _validate_block(self, block: Block) -> bool:
-        if block.proposer_id not in self.public_keys or not block.state_root:
-            return False
-        if block.height != self.committed_height + 1:
-            return False
-        if not 0 <= block.round or self.selector.proposer_for(block.height, block.round) != block.proposer_id:
-            return False
-        result = validate_block(
-            block, self.world_state, self.chain[self.committed_height].block_id,
-            proposer_public_key=self.public_keys[block.proposer_id], require_state_root=True,
-        )
-        return result.valid
-
     def propose_block(self) -> Optional[Block]:
         slot = (self.engine.height, self.engine.round)
         if (not self.running or self.crashed or self.silent_proposer
@@ -272,7 +263,7 @@ class Node:
                 if len(self._proposals) < self.max_pending:
                     self._proposals[(*slot, header["sender_id"])] = (header, block)
             return
-        if self.engine.votes.has(*slot, Phase.PREVOTE, self.node_id):
+        if self.engine.vote_pool.has(*slot, Phase.PREVOTE, self.node_id):
             return
         proof = self._parse_polka(header["polka"]) if header["polka"] else None
         if not self.engine.accept_proposal(
@@ -345,8 +336,8 @@ class Node:
             if len(self._pending_finalizations) < self.max_pending:
                 self._pending_finalizations.setdefault(block.height, (block, certificate))
             return False
-        if not self._validate_block(block):
-            self._log("REJECT_FINALIZE", reason="invalid block")
+        if not self.block_validator.validate(block, self.chain[self.committed_height]):
+            self._log("REJECT_FINALIZE", reason=self.block_validator.last_result.error)
             return False
         if self.engine.height == block.height:
             if not self.engine.accept_finalize(block, certificate):
@@ -466,7 +457,9 @@ class Node:
             if header["purpose"] == "FINALIZE":
                 self.commit_finalized_block(block, FinalizeCertificate.from_dict(header["certificate"]))
             elif header["purpose"] == "VALID":
-                if block.height == self.engine.height and self._validate_block(block):
+                if block.height == self.engine.height and self.block_validator.validate(
+                    block, self.chain[self.committed_height]
+                ):
                     self._remember_polka(self._parse_polka(header["polka"]), block)
             else:
                 self._handle_proposal(header, block)
@@ -501,10 +494,10 @@ class Node:
                 self.engine.height, self.engine.round, "PROPOSAL"
             ) and not self.silent_proposer:
                 self._announce(header, block)
-        for vote in self.engine.votes.votes(self.engine.height, self.engine.round, Phase.PREVOTE):
+        for vote in self.engine.vote_pool.get_round_votes(self.engine.height, self.engine.round, Phase.PREVOTE):
             if vote.voter_id == self.node_id:
                 self.network.broadcast(self.node_id, vote.to_dict(), kind=vote.phase.value, height=vote.height)
-        for vote in self.engine.votes.votes(self.engine.height, self.engine.round, Phase.PRECOMMIT):
+        for vote in self.engine.vote_pool.get_round_votes(self.engine.height, self.engine.round, Phase.PRECOMMIT):
             if vote.voter_id == self.node_id:
                 self.network.broadcast(self.node_id, vote.to_dict(), kind=vote.phase.value, height=vote.height)
         latest = max(self._known_polkas.values(), key=lambda p: (p.round, p.block_id), default=None)

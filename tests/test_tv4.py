@@ -1,59 +1,29 @@
 # %% [markdown]
-# TV4: integration and regression tests.
+# TV4: integration, regression and required public API tests.
 # Run: python -m pytest tests/test_tv4.py -v
-# The # %% markers also allow opening sections as interactive Python cells.
+# Assignment acceptance scenarios T1--T7 are in tests/test_T1_T7.py.
 
-# %% Imports and fixtures
 """Integration tests with real Ed25519 signatures and independent node states."""
 
 import json
-import re
 import sys
 from dataclasses import replace
+from inspect import signature
 from pathlib import Path
+from typing import get_type_hints
 
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from src.blockchain_simulator import BlockchainSimulator, SimulationConfig
-from src.consensus.locking import Polka
-from src.consensus.timeout import TimeoutConfig
-from src.crypto import ValidatorKeyStore, sha256_hex, sign_block, sign_vote, verify_vote_signature
-from src.execution import apply_transaction, validate_block, validate_transaction
-from src.models import Block, FinalizeCertificate, NIL_BLOCK_ID, Phase, ValidatorSet, Vote, _canonical_json
-from src.network import KIND_BODY_REQUEST, NetworkConfig, NetworkEnvelope, SendStatus
+from src.consensus.locking import Polka, VotePool
+from src.crypto import ValidatorKeyStore, compute_block_id, sign_block, verify_vote_signature
+from src.execution import BlockValidator
+from src.models import Block, FinalizeCertificate, NIL_BLOCK_ID, Phase, ValidatorSet, Vote
+from src.network import NetworkConfig, NetworkEnvelope, SendStatus
 from src.scheduler import Scheduler
-
-
-def make_simulator(num_nodes=4, seed=7, **kwargs):
-    network = kwargs.pop("network", NetworkConfig(min_delay=0.001, max_delay=0.01))
-    timeout = kwargs.pop("timeout", TimeoutConfig(base=0.2, multiplier=1.5, max_timeout=2))
-    return BlockchainSimulator(SimulationConfig(
-        num_nodes=num_nodes, seed=seed, network=network, timeout=timeout,
-        gossip_interval=0.05, **kwargs,
-    ))
-
-
-def empty_block(sim, height=1, round_=0, state_root=None):
-    proposer = sim.selector.proposer_for(height, round_)
-    node = sim.nodes[proposer]
-    return sign_block(Block(
-        height=height, round=round_, parent_id=node.chain[node.committed_height].block_id,
-        proposer_id=proposer, state_root=state_root or node.world_state.state_root(),
-    ), sim.key_store.private_key(proposer))
-
-
-def signed_vote(sim, voter, phase, block_id, height=1, round_=0):
-    return sim.key_store.sign_vote_as(Vote(height, round_, phase, block_id, voter), voter)
-
-
-def certificate(sim, block, round_=0, voters=None):
-    voters = voters or sim.node_ids[:sim.selector.quorum]
-    return FinalizeCertificate(block.height, round_, block.block_id, tuple(
-        signed_vote(sim, voter, Phase.PRECOMMIT, block.block_id, block.height, round_)
-        for voter in voters
-    ))
+from tests.simulation_helpers import certificate, empty_block, make_simulator, signed_vote
 
 
 # %% Node state, transaction validation and certificate verification
@@ -130,7 +100,7 @@ class TestNode:
                 "injected", "PREVOTE", "node_3", node.node_id, payload, 0, 0, height=1,
             ))
         assert len([e for e in node.events if e["event"] == "REJECT_MESSAGE"]) == 3
-        assert not node.engine.votes.votes(1, 0, Phase.PREVOTE)
+        assert not node.engine.vote_pool.get_round_votes(1, 0, Phase.PREVOTE)
         node.stop()
 
     def test_future_height_finalization_waits_for_parent(self):
@@ -187,7 +157,7 @@ class TestConsensusIntegration:
         assert not engine.polkas and not engine.finalized
         forged = replace(signed_vote(sim, "node_2", Phase.PREVOTE, "another"), voter_id="node_3")
         assert engine.receive_vote(forged) is None
-        assert engine.votes.count(1, 0, Phase.PREVOTE, "another") == 0
+        assert len(engine.vote_pool.get_votes(1, 0, Phase.PREVOTE, "another")) == 0
 
     def test_locked_block_reproposal_keeps_original_id(self):
         sim = make_simulator()
@@ -455,416 +425,145 @@ class TestSupportingRegressions:
         assert ValidatorKeyStore(["a"]).public_keys != ValidatorKeyStore(["a"]).public_keys
 
 
-# %% Acceptance matrix from the assignment image: T1--T7
-# Existing coverage:
-# T1: TestBlockchainSimulator.test_multiple_heights_and_signed_certificates
-# T2: TestConsensusIntegration + TV3 transport tests (no saved vote-pool trace)
-# T3: TV2 crypto + TestNode (missing explicit TX-signature-as-VOTE attack)
-# T4: TestNode (missing replay after commit and duplicate TX inside a block)
-# T5: TestBlockchainSimulator.test_loss_duplication_reordering_and_stabilization
-# T6: silent/crashed proposer tests (missing saved leader/round transition trace)
-# T7: test_consensus checks one engine; no distributed f-Byzantine scenario.
-# The acceptance tests below preserve evidence in outputs/tv4_evidence/*.json.
+# %% Required public API contracts and integration after the direct refactor
+class TestRequiredPublicAPIs:
+    def test_required_signatures_and_types(self):
+        assert list(signature(VotePool.add_vote).parameters) == ["self", "vote"]
+        for method in (VotePool.has_quorum, VotePool.get_votes):
+            assert list(signature(method).parameters) == ["self", "height", "round", "phase", "block_id"]
+        assert get_type_hints(VotePool.add_vote)["return"] is bool
+        assert get_type_hints(VotePool.has_quorum)["return"] is bool
+        assert get_type_hints(VotePool.get_votes)["return"] == list[Vote]
+        assert list(signature(BlockValidator.validate).parameters) == ["self", "block", "parent"]
+        assert get_type_hints(BlockValidator.validate)["return"] is bool
+        assert get_type_hints(Block)["block_id"] is str
+        block = empty_block(make_simulator())
+        assert type(block.block_id) is str and block.block_id == compute_block_id(block)
 
+    def test_get_votes_returns_an_independent_sorted_list(self):
+        pool = VotePool(("a", "b", "c", "d"))
+        for voter in ("c", "a", "b"):
+            assert pool.add_vote(Vote(1, 0, Phase.PREVOTE, "A", voter)) is True
+        result = pool.get_votes(1, 0, Phase.PREVOTE, "A")
+        assert type(result) is list
+        assert [vote.voter_id for vote in result] == ["a", "b", "c"]
+        result.clear()
+        assert pool.has_quorum(1, 0, Phase.PREVOTE, "A") is True
+        assert len(pool.get_votes(1, 0, Phase.PREVOTE, "A")) == 3
 
-@pytest.fixture
-def acceptance_evidence(request):
-    """Save real node/network logs separately from test-observer measurements.
+    def test_vote_pool_separates_each_slot_and_block(self):
+        pool = VotePool(("a", "b", "c", "d"))
+        for voter in ("a", "b", "c"):
+            assert pool.add_vote(Vote(1, 0, Phase.PREVOTE, "A", voter))
+        for height, round_, phase, block_id, voter in (
+            (2, 0, Phase.PREVOTE, "A", "a"),
+            (1, 1, Phase.PREVOTE, "A", "a"),
+            (1, 0, Phase.PRECOMMIT, "A", "a"),
+            (1, 0, Phase.PREVOTE, "B", "d"),
+        ):
+            assert pool.add_vote(Vote(height, round_, phase, block_id, voter))
+            assert len(pool.get_votes(height, round_, phase, block_id)) == 1
+            assert pool.has_quorum(height, round_, phase, block_id) is False
+        assert pool.has_quorum(1, 0, Phase.PREVOTE, "A") is True
 
-    No synthetic duplicate/replay/equivocation event is presented as a node
-    log. These measurements are explicitly labeled source='test_observer'.
-    Evidence is written during teardown, including after an assertion fails.
-    """
-    cases = {}
+    @pytest.mark.parametrize("phase", [Phase.PREVOTE, Phase.PRECOMMIT])
+    def test_vote_pool_deduplicates_conflicts_and_nil(self, phase):
+        pool = VotePool(("a", "b", "c", "d"))
+        first = Vote(1, 0, phase, "A", "a")
+        assert pool.add_vote(first) is True
+        assert pool.add_vote(first) is False
+        assert pool.add_vote(replace(first, block_id="B")) is False
+        assert pool.add_vote(replace(first, voter_id="outsider")) is False
+        assert pool.conflicts == [(first, replace(first, block_id="B"))]
+        assert pool.get_votes(1, 0, phase, "B") == []
+        for voter in ("b", "c"):
+            assert pool.add_vote(Vote(1, 0, phase, NIL_BLOCK_ID, voter))
+        assert pool.has_quorum(1, 0, phase, NIL_BLOCK_ID) is False
+        assert pool.add_vote(Vote(1, 0, phase, NIL_BLOCK_ID, "d"))
+        assert pool.has_quorum(1, 0, phase, NIL_BLOCK_ID) is True
+        assert pool.has_quorum(1, 0, phase, "A") is False
 
-    def record(test_id, sim, **measurements):
-        if test_id not in cases:
-            cases[test_id] = (sim, {})
-        cases[test_id][1].update(measurements)
+    @pytest.mark.parametrize("size,quorum", [(1, 1), (4, 3), (7, 5), (8, 6), (10, 7)])
+    def test_vote_pool_quorum_boundary(self, size, quorum):
+        ids = tuple(f"v{i}" for i in range(size))
+        pool = VotePool(ids)
+        assert pool.quorum == quorum
+        for voter in ids[:quorum - 1]:
+            assert pool.add_vote(Vote(1, 0, Phase.PREVOTE, "A", voter))
+        assert pool.has_quorum(1, 0, Phase.PREVOTE, "A") is False
+        assert pool.add_vote(Vote(1, 0, Phase.PREVOTE, "A", ids[quorum - 1]))
+        assert pool.has_quorum(1, 0, Phase.PREVOTE, "A") is True
 
-    yield record
-    folder = Path(__file__).resolve().parents[1] / "outputs" / "tv4_evidence"
-    folder.mkdir(parents=True, exist_ok=True)
-    name = re.sub(r"[^A-Za-z0-9_-]+", "_", request.node.name)
-    for test_id, (sim, measurements) in cases.items():
-        evidence = {
-            "test_id": test_id, "pytest_nodeid": request.node.nodeid,
-            "seed": sim.config.seed, "validators": sim.node_ids,
-            "validator_public_keys": sim.public_keys,
-            "correct_nodes": sim.correct_nodes, "faulty_nodes": sorted(sim.faulty_nodes),
-            "network_config": sim.network.config.to_dict(),
-            "simulation_time": sim.scheduler.now,
-            "finalized_block_hashes": {
-                name: {str(h): block.block_id for h, block in node.chain.items()}
-                for name, node in sim.nodes.items()
-            },
-            "state_hashes": {name: node.world_state.state_root() for name, node in sim.nodes.items()},
-            "states": {name: node.world_state.to_dict() for name, node in sim.nodes.items()},
-            "node_and_network_log": sim.log,
-            "test_observer": measurements,
-        }
-        (folder / f"{test_id}_{name}.json").write_text(
-            json.dumps(evidence, indent=2, sort_keys=True), encoding="utf-8",
-        )
-
-
-def observe_vote_guards(sim, monkeypatch):
-    """Measure the actual VoteGuard result and pool, without changing its result."""
-    trace = []
-    for name, node in sim.nodes.items():
-        guard = node.engine.votes
-        original_add = guard.add
-
-        def add(vote, *, name=name, guard=guard, original_add=original_add):
-            previous = next((v for v in guard.votes(vote.height, vote.round, vote.phase)
-                             if v.voter_id == vote.voter_id), None)
-            accepted = original_add(vote)
-            event = "vote_stored" if accepted else "vote_rejected"
-            if not accepted and previous is not None:
-                event = "equivocation" if previous.block_id != vote.block_id else "duplicate_ignored"
-            pool = [{"voter_id": v.voter_id, "block_id": v.block_id}
-                    for v in guard.votes(vote.height, vote.round, vote.phase)]
-            trace.append({
-                "source": "test_observer", "event": event, "time": sim.scheduler.now,
-                "node_id": name, "vote": vote.to_dict(), "accepted": accepted,
-                "previous_vote": previous.to_dict() if previous else None,
-                "vote_pool": pool,
-            })
-            return accepted
-
-        monkeypatch.setattr(guard, "add", add)
-    return trace
-
-
-def observe_finalizations(sim, monkeypatch):
-    """Check safety at every COMMIT, rather than only at the final snapshot."""
-    trace, committed = [], {}
-    for name in sim.correct_nodes:
-        node = sim.nodes[name]
-        original_log = node._log
-
-        def log(event, *, name=name, original_log=original_log, **details):
-            original_log(event, **details)
-            if event == "COMMIT":
-                key = (name, details["height"])
-                assert key not in committed, "a correct node committed the same height twice"
-                committed[key] = details["block_id"]
-                values = {bid for (peer, height), bid in committed.items() if height == details["height"]}
-                assert len(values) == 1, "correct nodes finalized conflicting blocks"
-                trace.append({"source": "test_observer", "time": sim.scheduler.now,
-                              "node_id": name, **details})
-                sim.assert_invariants()
-
-        monkeypatch.setattr(node, "_log", log)
-    return trace
-
-
-def assert_unique_vote_pools(trace):
-    for item in trace:
-        voters = [vote["voter_id"] for vote in item["vote_pool"]]
-        assert len(voters) == len(set(voters)), "one validator was counted more than once"
-
-
-def assert_common_chain(sim, target):
-    chains = [tuple(sim.nodes[name].chain[h].block_id for h in range(1, target + 1))
-              for name in sim.correct_nodes]
-    assert len(set(chains)) == 1
-    for h in range(1, target + 1):
-        assert len({sim.nodes[name].chain[h].state_root for name in sim.correct_nodes}) == 1
-    sim.assert_invariants()
-
-
-class TestAcceptanceRequirements:
-    @pytest.mark.parametrize("size", [8, 10])
-    def test_t1_normal_run_chain_and_state_hashes(self, size, monkeypatch, acceptance_evidence):
-        sim = make_simulator(size)
-        commits = observe_finalizations(sim, monkeypatch)
-        acceptance_evidence("T1", sim, finalization_observations=commits)
-        tx = sim.make_transaction("node_1", "node_2", 37, 0)
-        sim.submit_transaction(tx)
-        result = sim.run(3)
-        acceptance_evidence("T1", sim, finalization_observations=commits,
-                            completed=result.completed, stop_reason=result.stop_reason)
-        assert result.completed and len(sim.nodes) >= 8
-        assert sim.network.config.drop_rate == sim.network.config.duplicate_rate == 0
-        assert result.network_counters["dropped"] == 0
-        assert_common_chain(sim, 3)
-        assert len(set(result.state_roots_by_node.values())) == 1
-        assert all(node.world_state.get_balance(tx.sender) == 963 for node in sim.nodes.values())
-        assert all(node.world_state.get_nonce(tx.sender) == 1 for node in sim.nodes.values())
-        assert len(commits) >= 3 * size
-
-    def test_t2_duplicate_reordered_votes_count_once(self, monkeypatch, acceptance_evidence):
-        sim = make_simulator(8, network=NetworkConfig(
-            min_delay=0.001, max_delay=0.03, duplicate_rate=1.0,
-        ))
-        votes = observe_vote_guards(sim, monkeypatch)
-        commits = observe_finalizations(sim, monkeypatch)
-        acceptance_evidence("T2", sim, vote_guard_observations=votes, finalization_observations=commits)
-        result = sim.run(2)
-        order = {}
-        for event in sim.network.events:
-            if event.event == "DELIVER" and event.kind in ("PREVOTE", "PRECOMMIT"):
-                order.setdefault((event.node_id, event.peer_id), []).append(
-                    int(event.envelope_id.split("-")[1])
-                )
-        inversions = [{"sender": link[0], "recipient": link[1], "envelope_sequence": sequence}
-                      for link, sequence in order.items()
-                      if any(a > b for a, b in zip(sequence, sequence[1:]))]
-        acceptance_evidence("T2", sim, vote_guard_observations=votes,
-                            reordered_deliveries=inversions, finalization_observations=commits)
-        assert result.completed and result.network_counters["duplicates_created"] > 0
-        assert inversions, "the test must actually reorder vote packets"
-        assert any(item["event"] == "duplicate_ignored" for item in votes)
-        assert_unique_vote_pools(votes)
-        assert all(verify_vote_signature(Vote.from_dict(item["vote"]),
-                                        sim.public_keys[item["vote"]["voter_id"]]) for item in votes)
-        assert_common_chain(sim, 2)
-
-    @pytest.mark.parametrize("phase", [Phase.PREVOTE, Phase.PRECOMMIT], ids=["prevote", "precommit"])
-    @pytest.mark.parametrize("attack", ["tampered_payload", "tx_signature", "other_phase_signature"])
-    def test_t3_invalid_signature_and_wrong_domain(self, attack, phase, acceptance_evidence):
+    def test_node_and_engine_use_validator_with_live_committed_state(self, monkeypatch):
         sim = make_simulator()
-        leader = sim.selector.proposer_for(1, 0)
-        target_id = next(name for name in sim.node_ids if name != leader)
-        sender = next(name for name in sim.node_ids if name != target_id)
-        node = sim.nodes[target_id]
-        block = empty_block(sim)
-        assert node.engine.accept_proposal(block)
-        node.blocks[block.block_id] = block
-        valid = signed_vote(sim, sender, phase, block.block_id)
-        if attack == "tampered_payload":
-            invalid = replace(valid, block_id="payload-changed-after-signing")
-        elif attack == "tx_signature":
-            tx = sim.make_transaction(sender, target_id, 1, 0)
-            invalid = replace(valid, signature=tx.signature)
-        else:
-            other = Phase.PRECOMMIT if phase == Phase.PREVOTE else Phase.PREVOTE
-            invalid = replace(valid, signature=signed_vote(sim, sender, other, block.block_id).signature)
+        node = sim.nodes["node_1"]
+        validator = node.block_validator
+        assert isinstance(validator, BlockValidator)
+        assert node.engine.block_validator is validator
+        assert isinstance(node.engine.vote_pool, VotePool)
+        assert node.engine.parent_block is node.chain[0]
+        initial_state = node.world_state
+        calls = []
+        original = validator.validate
+
+        def validate(block, parent):
+            result = original(block, parent)
+            calls.append((block.height, parent.height, parent.block_id, result))
+            assert type(result) is bool
+            return result
+
+        monkeypatch.setattr(validator, "validate", validate)
+        tx = sim.make_transaction("node_1", "node_2", 19, 0)
+        sim.submit_transaction(tx)
+        assert sim.run(3).completed
+        assert node.world_state is not initial_state
+        assert initial_state.get_balance(tx.sender) == 1000
+        assert node.world_state.get_balance(tx.sender) == 981
+        assert node.engine.parent_block is node.chain[node.committed_height]
+        assert {height for height, _, _, valid in calls if valid} >= {1, 2, 3}
+        assert all(height == parent_height + 1 for height, parent_height, _, _ in calls)
+
+    @pytest.mark.parametrize("case", ["wrong_id", "wrong_height", "missing_parent", "wrong_parent_state"])
+    def test_block_validator_checks_parent_argument(self, case):
+        sim = make_simulator()
+        node = sim.nodes["node_1"]
+        parent, block = node.chain[0], empty_block(sim)
         before = node.world_state.to_dict()
-        acceptance_evidence("T3", sim, attack=attack, invalid_vote=invalid.to_dict(), state_before=before)
-        assert not verify_vote_signature(invalid, sim.public_keys[sender])
-        node.start()  # Only this non-proposer is active: isolate the rejection.
-        sim.network.send(sender, target_id, invalid.to_dict(), kind=phase.value, height=1)
-        sim.scheduler.run_until(0.04)
-        sim.stop()
-        failures = [event for event in node.events if event["event"] == "REJECT_MESSAGE"]
-        acceptance_evidence("T3", sim, attack=attack, invalid_vote=invalid.to_dict(),
-                            rejection_log=failures, state_before=before, state_after=node.world_state.to_dict())
-        assert failures and "signature" in failures[-1]["reason"]
-        assert node.engine.votes.count(1, 0, phase, invalid.block_id) == 0
-        assert node.committed_height == 0 and node.world_state.to_dict() == before
-
-    def test_t4_replay_before_and_after_commit(self, acceptance_evidence):
-        sim = make_simulator()
-        tx = sim.make_transaction("node_1", "node_2", 41, 0)
-        before = {name: node.world_state.to_dict() for name, node in sim.nodes.items()}
-        acceptance_evidence("T4", sim, source="test_observer", tx=tx.to_dict(), state_before=before)
-        assert all(sim.submit_transaction(tx).values())
-        duplicate_admission = sim.submit_transaction(tx)
-        assert not any(duplicate_admission.values())
-        assert sim.run(1).completed
-        after_first = {name: node.world_state.to_dict() for name, node in sim.nodes.items()}
-        replay_admission = sim.submit_transaction(tx)
-        replay_validation = {
-            name: validate_transaction(tx, node.world_state.copy()).error
-            for name, node in sim.nodes.items()
-        }
-        result = sim.run(3)
-        acceptance_evidence("T4", sim, source="test_observer", tx=tx.to_dict(),
-                            state_before=before, state_after_first_commit=after_first,
-                            duplicate_admission=duplicate_admission, replay_admission=replay_admission,
-                            replay_validation_errors=replay_validation)
-        assert result.completed
-        assert all("nonce" in reason for reason in replay_validation.values())
-        for name, node in sim.nodes.items():
-            assert node.world_state.to_dict() == after_first[name]
-            assert node.world_state.get_balance(tx.sender) == 959
-            assert node.world_state.get_nonce(tx.sender) == 1
-            assert sum(item == tx for block in node.chain.values() for item in block.transactions) == 1
-        assert_common_chain(sim, 3)
-
-    def test_t4_duplicate_signed_transaction_inside_block(self, monkeypatch, acceptance_evidence):
-        sim = make_simulator()
-        tx = sim.make_transaction("node_1", "node_2", 13, 0)
-        sim.submit_transaction(tx)
-        proposer = sim.nodes[sim.selector.proposer_for(1, 0)]
-        state = proposer.world_state.copy()
-        assert apply_transaction(tx, state).success
-        bad = sign_block(replace(empty_block(sim), transactions=(tx, tx), state_root=state.state_root()),
-                         proposer.private_key)
-        validation = validate_block(bad, proposer.world_state, proposer.engine.parent_id,
-                                    proposer_public_key=sim.public_keys[proposer.node_id], require_state_root=True)
-        acceptance_evidence("T4", sim, source="test_observer", duplicate_block=bad.to_dict(),
-                            validation_error=validation.error)
-        original = proposer.propose_block
-
-        def propose_duplicate():
-            if (proposer.engine.height, proposer.engine.round) != (1, 0):
-                return original()
-            header = proposer._make_header("PROPOSAL", bad, 0)
-            proposer._announce(header, bad)
-            proposer._handle_proposal(header, bad)
-            return bad
-
-        monkeypatch.setattr(proposer, "propose_block", propose_duplicate)
-        result = sim.run(2)
-        acceptance_evidence("T4", sim, source="test_observer", duplicate_block=bad.to_dict(),
-                            validation_error=validation.error)
-        assert not validation.valid and "tx[1]" in validation.error and "nonce" in validation.error
-        assert result.completed
-        assert all(node.chain[1].block_id != bad.block_id for node in sim.nodes.values())
-        assert any(event["event"] == "REJECT_PROPOSAL" for event in sim.log)
-        for node in sim.nodes.values():
-            assert node.world_state.get_balance(tx.sender) == 987
-            assert node.world_state.get_nonce(tx.sender) == 1
-
-    @pytest.mark.parametrize("seed", [7, 23])
-    def test_t5_safety_before_and_after_synchrony(self, seed, monkeypatch, acceptance_evidence):
-        stable_at = 0.4
-        sim = make_simulator(8, seed, network=NetworkConfig(
-            min_delay=0.001, max_delay=0.02, pre_synchrony_max_delay=0.15,
-            drop_rate=0.4, duplicate_rate=0.5, stabilize_at=stable_at,
-        ))
-        commits = observe_finalizations(sim, monkeypatch)
-        acceptance_evidence("T5", sim, stabilize_at=stable_at, finalization_observations=commits)
-        sim.start()
-        sim.scheduler.run_until(stable_at - 0.001)
-        heights_before = {name: node.committed_height for name, node in sim.nodes.items()}
-        sim.assert_invariants()
-        target = max(heights_before.values()) + 3
-        result = sim.run(target, max_simulation_time=10)
-        before_drops = [event.to_dict() for event in sim.network.events
-                        if event.event == "DROP" and event.time < stable_at and event.reason == "random_drop"]
-        after_sends = [event.to_dict() for event in sim.network.events
-                       if event.event == "SEND" and event.time >= stable_at]
-        delayed_before = [event.to_dict() for event in sim.network.events
-                          if event.event == "SEND" and event.time < stable_at
-                          and event.delay > sim.network.config.max_delay]
-        acceptance_evidence("T5", sim, stabilize_at=stable_at, heights_before_synchrony=heights_before,
-                            pre_synchrony_drops=before_drops, pre_synchrony_delays=delayed_before,
-                            post_synchrony_sends=after_sends,
-                            finalization_observations=commits)
-        assert before_drops and delayed_before
-        assert result.completed and after_sends
-        assert all(event["delay"] <= sim.network.config.max_delay for event in after_sends)
-        assert not any(event.event == "DROP" and event.time >= stable_at and event.reason == "random_drop"
-                       for event in sim.network.events)
-        assert any(item["time"] >= stable_at for item in commits)
-        assert_common_chain(sim, target)
-
-    @pytest.mark.parametrize("fault", ["silent", "crashed"])
-    def test_t6_timeout_round_change_and_next_proposer(self, fault, acceptance_evidence):
-        sim = make_simulator(8)
-        first = sim.selector.proposer_for(1, 0)
-        next_leader = sim.selector.proposer_for(1, 1)
-        acceptance_evidence("T6", sim, fault=fault, first_proposer=first, next_proposer=next_leader)
-        if fault == "silent":
-            sim.nodes[first].silent_proposer = True
+        if case == "wrong_id":
+            parent = replace(parent, block_id="wrong-parent")
+        elif case == "wrong_height":
+            parent = replace(parent, height=1)
+        elif case == "missing_parent":
+            parent = None
         else:
-            sim.schedule_crash(first, 0)
-        result = sim.run(2)
-        timeouts = [event for event in sim.log if event["event"] == "TIMEOUT" and event["expired_height"] == 1]
-        proposals = [event for event in sim.log if event["event"] == "PROPOSE" and event["height"] == 1]
-        acceptance_evidence("T6", sim, fault=fault, first_proposer=first, next_proposer=next_leader,
-                            timeout_log=timeouts, proposal_log=proposals)
-        assert result.completed and timeouts
-        assert any(event["expired_round"] == 0 and event["round"] == 1 for event in timeouts)
-        assert not any(event["round"] == 0 for event in proposals)
-        assert any(event["round"] == 1 and event["node_id"] == next_leader for event in proposals)
-        assert all(sim.nodes[name].certificates[1].round == 1 for name in sim.correct_nodes)
-        assert_common_chain(sim, 2)
+            parent = replace(parent, state_root="wrong-pre-state-root")
+        assert node.block_validator.validate(block, parent) is False
+        assert node.block_validator.last_result.error
+        assert node.world_state.to_dict() == before
 
-    @pytest.mark.parametrize("f", [1, 2, 3])
-    def test_t7_up_to_f_byzantine_equivocators(self, f, monkeypatch, acceptance_evidence):
-        """Use real signed conflicting votes and two valid equivocated proposals.
+    def test_block_validator_requires_root_in_node_configuration(self):
+        sim = make_simulator()
+        node = sim.nodes["node_1"]
+        block = empty_block(sim)
+        block = sign_block(replace(block, state_root=""), sim.key_store.private_key(block.proposer_id))
+        assert node.block_validator.validate(block, node.chain[0]) is False
+        assert node.block_validator.last_result.error == "missing state_root"
+        assert node.engine.accept_proposal(block) is False
 
-        Faulty validator handlers are replaced by an explicit network attacker.
-        Correct-node code and transport are unchanged. Different peer groups
-        see different first votes; subsequent contradictory votes include nil
-        so VoteGuard also records conflicts for candidates it already knows.
-        """
-        sim = make_simulator(3 * f + 1)
-        leader = sim.selector.proposer_for(1, 0)
-        others = [name for name in sim.node_ids if name != leader]
-        byzantine = [leader] + others[:f - 1]
-        sim.faulty_nodes.update(byzantine)
-        honest = sim.correct_nodes
-        assert len(byzantine) == f and len(sim.node_ids) == 3 * f + 1
-        votes = observe_vote_guards(sim, monkeypatch)
-        commits = observe_finalizations(sim, monkeypatch)
-        proposals = [empty_block(sim)]
-        proposals.append(sign_block(replace(proposals[0], timestamp=0.000001), sim.nodes[leader].private_key))
-        injections, deliveries = [], []
-        acceptance_evidence("T7", sim, f=f, conflicting_proposals=[b.to_dict() for b in proposals],
-                            injected_votes=injections, delivered_votes=deliveries,
-                            vote_guard_observations=votes, finalization_observations=commits)
-        for name in byzantine:
-            monkeypatch.setattr(sim.nodes[name], "start", lambda: None)
-
-        def serve_byzantine_body(node_id, envelope):
-            if envelope.kind == KIND_BODY_REQUEST:
-                entry = sim.nodes[leader]._outgoing.get(envelope.header_id)
-                if entry:
-                    header, block = entry
-                    sim.network.send_body(leader, envelope.sender_id, envelope.header_id,
-                                          {"block": block.to_dict()}, height=header["height"])
-
-        sim.network.set_receiver(leader, serve_byzantine_body)
-        for name in honest:
-            original = sim.nodes[name].on_receive
-
-            def receive(node_id, envelope, *, original=original):
-                if envelope.sender_id in byzantine and envelope.kind in ("PREVOTE", "PRECOMMIT"):
-                    deliveries.append({"source": "test_observer", "time": sim.scheduler.now,
-                                       "sender": envelope.sender_id, "recipient": node_id,
-                                       "vote": dict(envelope.payload)})
-                original(node_id, envelope)
-
-            sim.network.set_receiver(name, receive)
-
-        def attack():
-            for index, peer in enumerate(honest):
-                preferred = proposals[index % 2]
-                header = sim.nodes[leader]._make_header("PROPOSAL", preferred, 0)
-                sim.nodes[leader]._announce(header, preferred, [peer])
-                choices = [preferred.block_id, proposals[1 - index % 2].block_id, NIL_BLOCK_ID]
-                for sender in byzantine:
-                    for phase in (Phase.PREVOTE, Phase.PRECOMMIT):
-                        for order, block_id in enumerate(choices):
-                            vote = signed_vote(sim, sender, phase, block_id)
-                            injections.append({"source": "test_observer", "sender": sender,
-                                               "recipient": peer, "order": order, "vote": vote.to_dict()})
-                            # Deliver contradictory PREVOTEs before Byzantine
-                            # PRECOMMITs can finish height 1. Otherwise a fast
-                            # finalize would legitimately discard old conflicts.
-                            phase_start = 0.04 if phase == Phase.PREVOTE else 0.12
-                            sim.scheduler.schedule_after(
-                                phase_start + order * 0.015, sim.network.send, sender, peer, vote.to_dict(),
-                                kind=phase.value, height=1, tag="byzantine-equivocation",
-                            )
-
-        sim.scheduler.schedule_at(0, attack, tag="byzantine-proposals")
-        result = sim.run(2, max_simulation_time=15)
-        conflicts = [item for item in votes if item["event"] == "equivocation" and item["node_id"] in honest]
-        acceptance_evidence("T7", sim, f=f, conflicting_proposals=[b.to_dict() for b in proposals],
-                            injected_votes=injections, delivered_votes=deliveries,
-                            vote_guard_observations=votes, equivocation_observations=conflicts,
-                            finalization_observations=commits)
-        assert result.completed, "correct nodes must continue despite f equivocating validators"
-        assert proposals[0].block_id != proposals[1].block_id
-        assert conflicts, "the attack must exercise actual VoteGuard conflict handling"
-        for sender in byzantine:
-            observed = [item for item in deliveries if item["sender"] == sender]
-            assert {item["vote"]["block_id"] for item in observed} >= {b.block_id for b in proposals}
-            assert all(verify_vote_signature(Vote.from_dict(item["vote"]), sim.public_keys[sender]) for item in observed)
-            first_choices = {}
-            for item in observed:
-                if item["vote"]["phase"] == "PREVOTE":
-                    first_choices.setdefault(item["recipient"], item["vote"]["block_id"])
-            assert len(set(first_choices.values())) == 2
-        assert_unique_vote_pools(votes)
-        assert_common_chain(sim, 2)
+    def test_block_validator_does_not_commit_valid_prefix_of_invalid_block(self):
+        sim = make_simulator()
+        node = sim.nodes["node_1"]
+        tx1 = sim.make_transaction("node_1", "node_2", 10, 0)
+        tx2 = sim.make_transaction("node_1", "node_2", 10000, 1)
+        template = empty_block(sim)
+        invalid = sign_block(replace(template, transactions=(tx1, tx2)),
+                             sim.key_store.private_key(template.proposer_id))
+        before = node.world_state.to_dict()
+        assert node.block_validator.validate(invalid, node.chain[0]) is False
+        assert "tx[1]" in node.block_validator.last_result.error
+        assert node.world_state.to_dict() == before
+        assert node.block_validator.validate(template, node.chain[0]) is True
+        assert node.block_validator.last_result.error == ""
 
 
 # %% Run all cells as a regular script, or use pytest directly.

@@ -72,8 +72,8 @@ class TestConsensusEngine:
         assert engine.receive_vote(first) is None
         assert engine.receive_vote(first) is None
         assert engine.receive_vote(conflicting) is None
-        assert engine.votes.count(1, 0, Phase.PREVOTE, "A") == 1
-        assert len(engine.votes.conflicts) == 1
+        assert len(engine.vote_pool.get_votes(1, 0, Phase.PREVOTE, "A")) == 1
+        assert len(engine.vote_pool.conflicts) == 1
 
     def test_precommit_requires_polka_and_finalize_requires_quorum(self):
         engine = _engine()

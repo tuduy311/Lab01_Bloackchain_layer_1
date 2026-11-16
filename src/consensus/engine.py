@@ -5,9 +5,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Callable, Dict, Iterable, Optional, Tuple
 
-from src.consensus.locking import LockState, Polka, VoteGuard
+from src.consensus.locking import LockState, Polka, VotePool
 from src.consensus.proposer import ProposerSelector
 from src.crypto import verify_block_id, verify_block_signature, verify_vote_signature
+from src.execution import BlockValidator
 from src.models import (
     Block,
     FinalizeCertificate,
@@ -48,9 +49,10 @@ class ConsensusEngine:
         parent_id: str = "",
         proposer_selector: Optional[ProposerSelector] = None,
         require_signatures: bool = False,
-        block_validator: Optional[Callable[[Block], bool]] = None,
+        block_validator: Optional[BlockValidator] = None,
         public_key_resolver: Optional[Callable[[str], str]] = None,
         vote_signer: Optional[Callable[[Vote], Vote]] = None,
+        parent: Optional[Block] = None,
     ) -> None:
         self.node_id = node_id
         self.validators = tuple(validators)
@@ -60,16 +62,23 @@ class ConsensusEngine:
             raise ValueError("node_id must belong to validators")
         if height < 0:
             raise ValueError("height must be >= 0")
-        self.quorum = len(self.validators) - (len(self.validators) - 1) // 3
+        if parent is not None:
+            if parent.height != height - 1 or parent_id not in ("", parent.block_id):
+                raise ValueError("parent must match height and parent_id")
+            parent_id = parent.block_id
+        if block_validator is not None and not isinstance(block_validator, BlockValidator):
+            raise TypeError("block_validator must be a BlockValidator")
+        self.vote_pool = VotePool(self.validators)
+        self.quorum = self.vote_pool.quorum
         self.selector = proposer_selector or ProposerSelector(self.validators)
         self.require_signatures = require_signatures
         self.block_validator = block_validator
         self.public_key_resolver = public_key_resolver or (lambda validator: validator)
         self.vote_signer = vote_signer or (lambda vote: vote)
         self.parent_id = parent_id
+        self.parent_block = parent
         self.state = ConsensusState(height=height)
         self.lock = LockState()
-        self.votes = VoteGuard(self.validators)
         self.blocks: Dict[str, Block] = {}
         self.polkas: Dict[Tuple[int, int, str], Polka] = {}
         self.finalized: Dict[int, FinalizeCertificate] = {}
@@ -131,7 +140,9 @@ class ConsensusEngine:
             block, self.public_key_resolver(block.proposer_id)
         ):
             return False
-        if self.block_validator is not None and not self.block_validator(block):
+        if self.block_validator is not None and (
+            self.parent_block is None or not self.block_validator.validate(block, self.parent_block)
+        ):
             return False
         if block.round < round_ and valid_round_polka is None:
             return False
@@ -169,7 +180,7 @@ class ConsensusEngine:
         if not self.lock.can_prevote(candidate, self.round, polka):
             candidate = self.lock.locked_block_id or NIL_BLOCK_ID
         vote = self.vote_signer(Vote(self.height, self.round, Phase.PREVOTE, candidate, self.node_id))
-        if not self.votes.add(vote):
+        if not self.vote_pool.add_vote(vote):
             raise ValueError("validator already prevoted this height and round")
         self.state.phase = Phase.PREVOTE
         return vote
@@ -182,7 +193,7 @@ class ConsensusEngine:
         ):
             raise ValueError("precommit requires a quorum prevote polka")
         vote = self.vote_signer(Vote(self.height, self.round, Phase.PRECOMMIT, candidate, self.node_id))
-        if not self.votes.add(vote):
+        if not self.vote_pool.add_vote(vote):
             raise ValueError("validator already precommitted this height and round")
         self.state.phase = Phase.PRECOMMIT
         return vote
@@ -204,7 +215,7 @@ class ConsensusEngine:
             vote, self.public_key_resolver(vote.voter_id)
         ):
             return None
-        if not self.votes.add(vote):
+        if not self.vote_pool.add_vote(vote):
             return None
 
         if vote.phase == Phase.PREVOTE:
@@ -218,21 +229,21 @@ class ConsensusEngine:
         if (vote.block_id == NIL_BLOCK_ID or vote.block_id not in self.blocks
                 or self.blocks[vote.block_id].height != vote.height):
             return None
-        if self.votes.count(
+        if not self.vote_pool.has_quorum(
             vote.height, vote.round, Phase.PREVOTE, vote.block_id
-        ) < self.quorum:
+        ):
             return None
-        votes = self.votes.votes(
+        votes = self.vote_pool.get_votes(
             vote.height, vote.round, Phase.PREVOTE, vote.block_id
         )
-        polka = Polka(vote.height, vote.round, vote.block_id, votes)
+        polka = Polka(vote.height, vote.round, vote.block_id, tuple(votes))
         self.polkas[(vote.height, vote.round, vote.block_id)] = polka
         self.lock.apply_polka(polka)
         self._sync_lock_state()
         self.state.phase = Phase.PRECOMMIT
         if self.node_id not in {item.voter_id for item in votes}:
             return None
-        if self.votes.has(self.height, self.round, Phase.PRECOMMIT, self.node_id):
+        if self.vote_pool.has(self.height, self.round, Phase.PRECOMMIT, self.node_id):
             return None
         return self.make_precommit(vote.block_id)
 
@@ -243,20 +254,20 @@ class ConsensusEngine:
             or self.blocks[vote.block_id].height != vote.height
         ):
             return None
-        if self.votes.count(
+        if not self.vote_pool.has_quorum(
             vote.height, vote.round, Phase.PRECOMMIT, vote.block_id
-        ) < self.quorum:
+        ):
             return None
         if vote.block_id == NIL_BLOCK_ID:
             self._advance_round()
             return None
         if vote.height in self.finalized:
             return None
-        precommits = self.votes.votes(
+        precommits = self.vote_pool.get_votes(
             vote.height, vote.round, Phase.PRECOMMIT, vote.block_id
         )
         certificate = FinalizeCertificate(
-            vote.height, vote.round, vote.block_id, precommits
+            vote.height, vote.round, vote.block_id, tuple(precommits)
         )
         self.finalized[vote.height] = certificate
         self.state.phase = Phase.FINALIZE
@@ -266,17 +277,17 @@ class ConsensusEngine:
     def poll(self) -> Tuple[object, ...]:
         """Evaluate stored votes after a local vote or reordered delivery.
 
-        Local votes are already in VoteGuard, so feeding them back through
+        Local votes are already in VotePool, so feeding them back through
         receive_vote would only hit deduplication. This method never re-signs
         or re-broadcasts a vote and may return a precommit and certificate.
         """
         actions = []
         slot = (self.height, self.round)
-        for vote in self.votes.votes(*slot, Phase.PREVOTE):
+        for vote in self.vote_pool.get_round_votes(*slot, Phase.PREVOTE):
             action = self._on_prevote(vote)
             if action is not None:
                 actions.append(action)
-        for vote in self.votes.votes(*slot, Phase.PRECOMMIT):
+        for vote in self.vote_pool.get_round_votes(*slot, Phase.PRECOMMIT):
             action = self._on_precommit(vote)
             if action is not None:
                 actions.append(action)
@@ -325,7 +336,9 @@ class ConsensusEngine:
             block, self.public_key_resolver(block.proposer_id)
         ):
             return False
-        if self.block_validator is not None and not self.block_validator(block):
+        if self.block_validator is not None and (
+            self.parent_block is None or not self.block_validator.validate(block, self.parent_block)
+        ):
             return False
         if block.height in self.finalized:
             return False
@@ -337,9 +350,10 @@ class ConsensusEngine:
     def _advance_height(self, certificate: FinalizeCertificate) -> None:
         block = self.blocks.get(certificate.block_id)
         self.parent_id = certificate.block_id
+        self.parent_block = block
         self.state = ConsensusState(height=certificate.height + 1)
         self.lock.reset()
-        self.votes.clear_before(self.state.height)
+        self.vote_pool.clear_before(self.state.height)
         self.polkas.clear()
         if block is not None:
             self.blocks = {block.block_id: block}
@@ -353,12 +367,17 @@ class ConsensusEngine:
         self._advance_round()
         return True
 
-    def reset_height(self, height: int, parent_id: str = "") -> None:
+    def reset_height(self, height: int, parent_id: str = "", *, parent: Optional[Block] = None) -> None:
         """Reset the engine for an externally selected height."""
         if height < 0:
             raise ValueError("height must be >= 0")
+        if parent is not None:
+            if parent.height != height - 1 or parent_id not in ("", parent.block_id):
+                raise ValueError("parent must match height and parent_id")
+            parent_id = parent.block_id
         self.parent_id = parent_id
+        self.parent_block = parent
         self.state = ConsensusState(height=height)
         self.lock.reset()
-        self.votes.clear_before(height)
+        self.vote_pool.clear_before(height)
         self.polkas.clear()
