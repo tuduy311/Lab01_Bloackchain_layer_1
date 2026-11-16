@@ -23,7 +23,7 @@ from src.crypto import (
 from src.execution import (
     AccountState, WorldState, TxResult,
     validate_transaction, apply_transaction, execute_block,
-    create_genesis_state, validate_block, BlockValidationResult,
+    create_genesis_state, BlockValidator, BlockValidationResult,
 )
 
 
@@ -665,7 +665,11 @@ class TestBlockExecution:
 # =========================================================================
 
 class TestBlockValidation:
-    """Test validate_block — the pre-vote gating check."""
+    """Test the required BlockValidator.validate(block, parent) API."""
+
+    def _parent(self, block_id="genesis"):
+        # The caller supplies a trusted parent; these unit tests use symbolic IDs.
+        return Block(height=0, round=0, parent_id="", block_id=block_id)
 
     def _setup(self):
         priv, pub = generate_keypair()
@@ -691,35 +695,34 @@ class TestBlockValidation:
     def test_valid_block_passes(self):
         priv, pub, state = self._setup()
         block = self._make_valid_block(priv, pub, state)
-        result = validate_block(block, state, "genesis",
-                                proposer_public_key=pub,
-                                require_state_root=True)
-        assert result.valid
+        validator = BlockValidator(state, proposer_public_key=pub, require_state_root=True)
+        assert validator.validate(block, self._parent()) is True
+        assert isinstance(validator.last_result, BlockValidationResult)
 
     def test_wrong_block_id_fails(self):
         priv, pub, state = self._setup()
         import dataclasses
         block = self._make_valid_block(priv, pub, state)
         tampered = dataclasses.replace(block, block_id="wrong_id")
-        result = validate_block(tampered, state, "genesis", proposer_public_key=pub)
-        assert not result.valid
-        assert "block_id" in result.error
+        validator = BlockValidator(state, proposer_public_key=pub)
+        assert validator.validate(tampered, self._parent()) is False
+        assert "block_id" in validator.last_result.error
 
     def test_wrong_parent_id_fails(self):
         priv, pub, state = self._setup()
         block = self._make_valid_block(priv, pub, state, parent_id="genesis")
-        result = validate_block(block, state, "wrong_parent", proposer_public_key=pub)
-        assert not result.valid
-        assert "parent_id" in result.error
+        validator = BlockValidator(state, proposer_public_key=pub)
+        assert validator.validate(block, self._parent("wrong_parent")) is False
+        assert "parent_id" in validator.last_result.error
 
     def test_invalid_proposer_signature_fails(self):
         priv, pub, state = self._setup()
         _, pub2 = generate_keypair()
         block = self._make_valid_block(priv, pub, state)
         # Verify with the wrong public key
-        result = validate_block(block, state, "genesis", proposer_public_key=pub2)
-        assert not result.valid
-        assert "signature" in result.error
+        validator = BlockValidator(state, proposer_public_key=pub2)
+        assert validator.validate(block, self._parent()) is False
+        assert "signature" in validator.last_result.error
 
     def test_invalid_tx_in_block_fails(self):
         priv, pub, state = self._setup()
@@ -732,9 +735,9 @@ class TestBlockValidation:
         b2 = Block(height=1, round=0, parent_id="genesis",
                    transactions=(bad_tx,), proposer_id=pub, state_root="")
         signed = sign_block(b2, priv)
-        result = validate_block(signed, state, "genesis")
-        assert not result.valid
-        assert "tx[0]" in result.error
+        validator = BlockValidator(state)
+        assert validator.validate(signed, self._parent()) is False
+        assert "tx[0]" in validator.last_result.error
 
     def test_state_root_mismatch_fails(self):
         priv, pub, state = self._setup()
@@ -742,11 +745,9 @@ class TestBlockValidation:
         b = Block(height=1, round=0, parent_id="genesis",
                   proposer_id=pub, state_root="wrong_state_root")
         signed = sign_block(b, priv)
-        result = validate_block(signed, state, "genesis",
-                                proposer_public_key=pub,
-                                require_state_root=True)
-        assert not result.valid
-        assert "state_root" in result.error
+        validator = BlockValidator(state, proposer_public_key=pub, require_state_root=True)
+        assert validator.validate(signed, self._parent()) is False
+        assert "state_root" in validator.last_result.error
 
     def test_valid_block_with_transactions(self):
         priv, pub, state = self._setup()
@@ -758,44 +759,45 @@ class TestBlockValidation:
         b2 = Block(height=1, round=0, parent_id="genesis",
                    transactions=(tx,), proposer_id=pub, state_root=sr)
         signed = sign_block(b2, priv)
-        result = validate_block(signed, state, "genesis",
-                                proposer_public_key=pub,
-                                require_state_root=True)
-        assert result.valid
-        assert result.state_root == sr
+        validator = BlockValidator(state, proposer_public_key=pub, require_state_root=True)
+        assert validator.validate(signed, self._parent()) is True
+        assert validator.last_result.state_root == sr
 
     def test_no_signature_check_when_key_not_provided(self):
         priv, pub, state = self._setup()
         block = self._make_valid_block(priv, pub, state)
         # No proposer_public_key → signature is not checked
-        result = validate_block(block, state, "genesis")
-        assert result.valid
+        validator = BlockValidator(state)
+        assert validator.validate(block, self._parent()) is True
 
-    def test_validate_block_returns_computed_state_root(self):
+    def test_validator_records_computed_state_root(self):
         priv, pub, state = self._setup()
         _, recv = generate_keypair()
         tx = _make_signed_tx(priv, pub, recv, 100, 0)
         b = Block(height=1, round=0, parent_id="genesis",
                   transactions=(tx,), proposer_id=pub)
         signed = sign_block(b, priv)
-        result = validate_block(signed, state, "genesis")
-        assert result.valid
+        validator = BlockValidator(state)
+        assert validator.validate(signed, self._parent()) is True
         # The returned state_root should equal what execute_block produces
         _, _, expected_root, _ = execute_block(b, state, dry_run=True)
-        assert result.state_root == expected_root
+        assert validator.last_result.state_root == expected_root
 
     def test_empty_block_validates(self):
         priv, pub, state = self._setup()
         b = Block(height=1, round=0, parent_id="genesis", proposer_id=pub)
         signed = sign_block(b, priv)
-        result = validate_block(signed, state, "genesis", proposer_public_key=pub)
-        assert result.valid
+        validator = BlockValidator(state, proposer_public_key=pub)
+        assert validator.validate(signed, self._parent()) is True
 
-    def test_duplicate_vote_guard_independent_of_validate_block(self):
-        """validate_block is stateless — calling it twice is idempotent."""
+    def test_validation_is_repeatable_without_mutating_state(self):
+        """Repeated validation returns a bool and never commits execution."""
         priv, pub, state = self._setup()
         block = self._make_valid_block(priv, pub, state)
-        r1 = validate_block(block, state, "genesis", proposer_public_key=pub)
-        r2 = validate_block(block, state, "genesis", proposer_public_key=pub)
-        assert r1.valid and r2.valid
-        assert r1.state_root == r2.state_root
+        validator = BlockValidator(state, proposer_public_key=pub)
+        before = state.to_dict()
+        assert validator.validate(block, self._parent()) is True
+        first_root = validator.last_result.state_root
+        assert validator.validate(block, self._parent()) is True
+        assert first_root == validator.last_result.state_root
+        assert state.to_dict() == before

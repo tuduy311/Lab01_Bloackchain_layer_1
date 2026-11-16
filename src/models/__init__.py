@@ -425,8 +425,8 @@ class ValidatorSet:
 
     @property
     def quorum(self) -> int:
-        """Minimum vote count for a quorum: ``2f + 1``."""
-        return 2 * self.f + 1
+        """``n - f`` (equals ``2f + 1`` when ``n = 3f + 1``)."""
+        return self.n - self.f
 
     def __contains__(self, validator_id: str) -> bool:
         return validator_id in self.validators

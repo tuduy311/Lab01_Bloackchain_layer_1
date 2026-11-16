@@ -1,4 +1,4 @@
-"""Locking and vote-signing guards for the BFT consensus state machine."""
+"""Locking and the VotePool API for the BFT consensus state machine."""
 
 from __future__ import annotations
 
@@ -81,15 +81,23 @@ class LockState:
         self.valid_round = None
 
 
-class VoteGuard:
-    """Deduplicate votes and enforce one vote per validator and phase."""
+class VotePool:
+    """Store one vote per validator/slot and query a deterministic quorum.
+
+    Signature authentication belongs to the receiving node/consensus engine.
+    The pool enforces membership and deduplication, including equivocation.
+    """
 
     def __init__(self, validators: Iterable[str]) -> None:
+        validators = tuple(validators)
+        if not validators or len(set(validators)) != len(validators):
+            raise ValueError("validators must be non-empty and unique")
         self.validators: Set[str] = set(validators)
+        self.quorum = len(validators) - (len(validators) - 1) // 3
         self._votes: Dict[VoteKey, Vote] = {}
         self.conflicts: list[Tuple[Vote, Vote]] = []
 
-    def add(self, vote: Vote) -> bool:
+    def add_vote(self, vote: Vote) -> bool:
         """Store ``vote`` once; return ``False`` for duplicate/conflict."""
         if vote.voter_id not in self.validators:
             return False
@@ -102,28 +110,30 @@ class VoteGuard:
         self._votes[key] = vote
         return True
 
-    def votes(
-        self,
-        height: int,
-        round: int,
-        phase: Phase,
-        block_id: Optional[str] = None,
-    ) -> Tuple[Vote, ...]:
-        values = tuple(
-            vote for key, vote in self._votes.items()
-            if key[:3] == (height, round, phase)
-            and (block_id is None or vote.block_id == block_id)
-        )
-        return tuple(sorted(values, key=lambda vote: vote.voter_id))
-
-    def count(
+    def get_votes(
         self,
         height: int,
         round: int,
         phase: Phase,
         block_id: str,
-    ) -> int:
-        return len(self.votes(height, round, phase, block_id))
+    ) -> list[Vote]:
+        """Return a fresh list for exactly one height/round/phase/block."""
+        return [vote for vote in self.get_round_votes(height, round, phase)
+                if vote.block_id == block_id]
+
+    def has_quorum(
+        self,
+        height: int,
+        round: int,
+        phase: Phase,
+        block_id: str,
+    ) -> bool:
+        return len(self.get_votes(height, round, phase, block_id)) >= self.quorum
+
+    def get_round_votes(self, height: int, round: int, phase: Phase) -> list[Vote]:
+        """All candidates in a slot, used for retransmission and engine polling."""
+        return sorted((vote for key, vote in self._votes.items()
+                       if key[:3] == (height, round, phase)), key=lambda vote: vote.voter_id)
 
     def has(self, height: int, round: int, phase: Phase, voter_id: str) -> bool:
         return (height, round, phase, voter_id) in self._votes

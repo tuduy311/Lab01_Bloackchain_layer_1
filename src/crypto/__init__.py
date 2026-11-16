@@ -19,7 +19,7 @@ for easy JSON serialisation.
 from __future__ import annotations
 
 import hashlib
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from cryptography.hazmat.primitives.asymmetric.ed25519 import (
     Ed25519PrivateKey,
@@ -274,7 +274,7 @@ class ValidatorKeyStore:
     True
     """
 
-    def __init__(self, validator_ids: List[str]) -> None:
+    def __init__(self, validator_ids: List[str], seed: Optional[int] = None) -> None:
         if not validator_ids:
             raise ValueError("ValidatorKeyStore: need at least one validator")
         if len(set(validator_ids)) != len(validator_ids):
@@ -283,7 +283,12 @@ class ValidatorKeyStore:
         self._private: Dict[str, str] = {}
         self._public: Dict[str, str] = {}
         for vid in validator_ids:
-            priv, pub = generate_keypair()
+            if seed is None:
+                priv, pub = generate_keypair()
+            else:
+                # Reproducible simulator keys, NOT secret production keys.
+                priv = sha256_hex(f"lab01:validator:{seed}:{vid}".encode("utf-8"))
+                pub = public_key_from_private(priv)
             self._private[vid] = priv
             self._public[vid] = pub
 

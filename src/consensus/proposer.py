@@ -82,8 +82,8 @@ class ProposerSelector:
 
     @property
     def quorum(self) -> int:
-        """``2f + 1`` for ``n = 3f + 1`` (rounded down for other sizes)."""
-        return 2 * (self.size // 3) + 1 if self.size >= 4 else self.size
+        """``n - f``, where ``f = (n - 1) // 3``; safe also for n=8."""
+        return self.size - (self.size - 1) // 3
 
     @property
     def engine_order(self) -> Tuple[str, ...]:

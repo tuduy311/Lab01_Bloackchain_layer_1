@@ -182,10 +182,9 @@ class Scheduler:
 
     def peek_time(self) -> Optional[float]:
         """Time of the next pending event, or ``None`` when idle."""
-        for ticks, _seq, event_id, _cb, _args, _kw in self._heap:
-            if event_id in self._live:
-                return to_seconds(ticks)
-        return None
+        while self._heap and self._heap[0][2] not in self._live:
+            heapq.heappop(self._heap)
+        return to_seconds(self._heap[0][0]) if self._heap else None
 
     def __len__(self) -> int:
         """Number of pending (non-cancelled) events."""
@@ -208,7 +207,7 @@ class Scheduler:
         """Execute every event with time ``<= end_time``; return how many ran."""
         limit = to_ticks(end_time)
         count = 0
-        while self._heap and self._heap[0][0] <= limit:
+        while self.peek_time() is not None and self._heap[0][0] <= limit:
             if not self.step():
                 break
             count += 1
