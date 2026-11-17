@@ -43,14 +43,80 @@ Lab01_Bloackchain_layer_1/
 ├── config/                     # Cấu hình số node, seed, timeout
 ├── logs/                       # Log sinh ra khi chạy
 ├── scripts/                    # Script kiểm tra tính xác định
+│   └── deterministic_check.py
 ├── main.py                     # Entry point duy nhất
+├── REPORT.txt                  # Nội dung báo cáo, tự chuyển sang PDF
 ├── README.md
-└── REPORT.pdf
+└── REPORT.pdf                  # Tạo từ REPORT.txt khi nộp
 ```
 
-## 4. Đặc tả Consensus State Machine (TV1, TV2, TV4)
+## 4. Cài đặt và chạy
 
-### 4.1. Tham số và thuật ngữ
+PowerShell trên Windows:
+
+```powershell
+cd C:\Users\tuduy\Documents\blockchain\lab01\Lab01_Bloackchain_layer_1
+python -m pip install -r requirements.txt
+python main.py --nodes 8 --seed 0 --height 3
+```
+
+Đây là lệnh chạy đầy đủ một scenario: tạo validator set, khởi tạo genesis
+state, ký và nạp transaction, chạy mạng/consensus đến height yêu cầu, ghi log
+chuẩn hóa, rồi tự chạy lại cùng scenario để kiểm tra T8. Kết quả được ghi vào
+`logs/run.jsonl` và `logs/summary.json`. Timestamp trong log là virtual time
+của simulator, không phải đồng hồ hệ thống.
+
+Các tham số có thể thay đổi:
+
+```text
+--nodes   số validator (mặc định 8)
+--seed    seed tái lập mạng và key mô phỏng (mặc định 0)
+--height  số block cần finalize (mặc định 3)
+--log     đường dẫn JSONL log (mặc định logs/run.jsonl)
+--summary đường dẫn summary (mặc định logs/summary.json)
+```
+
+### 4.1. Luồng chạy một lệnh
+
+1. `main.py` đọc tham số và tạo `SimulationConfig`.
+2. `BlockchainSimulator` tạo scheduler, network, validator keys,
+   proposer selector và các node độc lập.
+3. Transaction được ký bằng Ed25519 và gửi đến mempool của các node.
+4. Scheduler gọi node proposer; proposer tạo block trên parent hiện tại.
+5. Header được broadcast trước; node nhận kiểm tra proposer, chữ ký, parent,
+   transaction và state root trước khi yêu cầu body.
+6. Node phát PREVOTE. VotePool kiểm tra chữ ký, domain, height/round/phase và
+   loại duplicate hoặc conflicting vote.
+7. Quorum PREVOTE tạo polka; node lock block và phát PRECOMMIT.
+8. Quorum PRECOMMIT tạo certificate; node kiểm tra certificate, commit block
+   đúng một lần và chuyển sang height tiếp theo.
+9. Khi đạt `--height`, simulator kiểm tra chain, certificate và state root của
+   các correct node.
+10. Cùng scenario được chạy lại trong bộ nhớ. Hai log canonical và state root
+    được so sánh để báo kết quả T8.
+
+Vì vậy sau khi đã cài dependency, người dùng chỉ cần một lệnh chạy chương
+trình:
+
+```powershell
+python main.py --nodes 8 --seed 0 --height 3
+```
+
+## 5. Kiểm tra T1--T8
+
+```powershell
+python -m pytest tests -v
+python scripts/deterministic_check.py --nodes 8 --seed 0 --height 3
+```
+
+Lệnh `main.py` đã tự kiểm tra T8 cho scenario bình thường. Lệnh trên là
+checker độc lập dùng khi cần audit riêng. T8 chỉ đạt khi
+`logs_byte_identical`, `state_hash_identical`, `all_nodes_agree` và
+`completed` đều là `true`.
+
+## 6. Đặc tả Consensus State Machine (TV1, TV2, TV4)
+
+### 6.1. Tham số và thuật ngữ
 
 Consensus được chạy độc lập cho từng `height` và theo các `round` bắt đầu từ
 `0`. Với `n = 3f + 1` validator, quorum là:
@@ -78,7 +144,7 @@ valid_block_id ∈ {block_id, nil}
 `valid_block_id` là block đã có chứng cứ `QUORUM` prevote và có thể dùng để
 chọn proposal ở round tiếp theo.
 
-### 4.2. Flow Proposal -> Prevote -> Precommit -> Finalize
+### 6.2. Flow Proposal -> Prevote -> Precommit -> Finalize
 
 Mỗi bước chỉ chuyển tiếp trong cùng `height` và `round`; message đến height
 khác phải bị loại trước khi xử lý.
@@ -133,7 +199,7 @@ PREVOTE -- QUORUM prevote (polka) --> PRECOMMIT
                      FINALIZE
 ```
 
-### 4.3. Lock, unlock và an toàn
+### 6.3. Lock, unlock và an toàn
 
 - **Lock:** chỉ lock khi node quan sát `QUORUM` prevote cho một block. Khi
   lock `B`, ghi cả `locked_block_id = B` và `locked_round`.
@@ -149,7 +215,7 @@ PREVOTE -- QUORUM prevote (polka) --> PRECOMMIT
   trong đó phải có ít nhất một validator đúng; validator đúng không vote
   xung đột và tuân thủ lock.
 
-### 4.4. Duplicate guard và điều kiện loại message
+### 6.4. Duplicate guard và điều kiện loại message
 
 Mỗi vote được deduplicate bằng khóa:
 
@@ -171,7 +237,7 @@ state transition. Các map counter phải đếm theo `voter_id`, không đếm 
 message nhận được. Conflicting vote của cùng một voter được ghi nhận là
 vi phạm Byzantine nhưng vẫn chỉ tính tối đa một vote trong mỗi chứng cứ.
 
-### 4.5. Hợp đồng kiểm thử tối thiểu
+### 6.5. Hợp đồng kiểm thử tối thiểu
 
 TV4 cần kiểm tra ít nhất các trường hợp sau:
 

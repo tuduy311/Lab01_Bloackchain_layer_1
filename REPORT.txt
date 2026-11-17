@@ -1,0 +1,431 @@
+LAB 01 - MINIMAL LAYER 1 BLOCKCHAIN
+BAO CAO KY THUAT VA KET QUA THUC NGHIEM
+
+Ghi chu dinh dang:
+File nay la noi dung nguon de chuyen sang REPORT.pdf. Khi dan trang, dung
+font Times New Roman 12 pt, line spacing 1.15, can le 2.5 cm, tieu de dam,
+va chen cac so do ASCII o vi tri tuong ung. Với dinh dang nay, noi dung du
+kien dai khoang 5-9 trang tuy cach dat hinh va bang.
+
+======================================================================
+1. THONG TIN NHOM
+======================================================================
+
+Mon hoc: Blockchain course
+Bai: LAB 01 - Blockchain Layer 1
+Nam hoc: 2026
+Nhom: ..............................................................
+
+Thanh vien:
+
+TV1 - Tu: Consensus Lead (Core Machine)
+TV2 - Tuan: Cryptography, Execution va Vote Storage
+TV3 - Phu: Network, Scheduler, Proposer va Timeout
+TV4 - ................................: Integration va Test Runner
+TV5 - ................................: Deterministic Logging, QA va Docs
+
+Thay ten thanh vien va ma so sinh vien truoc khi chuyen file sang PDF.
+
+======================================================================
+2. TOM TAT
+======================================================================
+
+Bai lab xay dung mot blockchain Layer 1 toi gian co kha nang dat finality
+trong mang mo phong khong tin cay. He thong co validator set co dinh, moi
+node giu ledger va state rieng, va cac node chi trao doi signed message
+thong qua network simulator. Muc tieu chinh la safety: hai block khac nhau
+khong the cung duoc finalize o cung mot height. Sau khi mang on dinh va
+proposer dung duoc chon, he thong phai co liveness: chain tiep tuc duoc
+finalize.
+
+Thiet ke su dung n = 3f + 1 validator va quorum 2f + 1. Consensus co bon
+buoc Proposal, Prevote, Precommit va Finalize. Transaction, block header va
+vote deu duoc ky; payload ky dung canonical encoding va domain separation.
+State duoc cap nhat theo mot thu tu transaction co dinh, sau do state root
+duoc commit trong block header.
+
+Ket qua regression hien tai gom 253 test pass. T8 chay lai cung seed cho
+log giong nhau tung byte, state root cua cac node giong nhau va khong co
+conflicting finalization.
+
+======================================================================
+3. YEU CAU VA GIA DINH HE THONG
+======================================================================
+
+3.1. Yeu cau bai lab
+
+He thong phai:
+
+- Tao duoc blockchain voi block link bang parent hash.
+- Xac thuc transaction, header va vote bang chu ky.
+- Xu ly duplicate, delay, drop va reorder message.
+- Khong double-count vote cua mot validator.
+- Khong finalize hai block khac nhau tai cung height.
+- Tiep tuc sau timeout khi proposer silent hoac crashed.
+- Chay lai cung cau hinh va seed cho log va state hash byte-identical.
+- Co unit test, end-to-end test, README va bao cao khong chen source code.
+
+3.2. Mo hinh loi
+
+Validator set khong thay doi trong mot run. Toi da f validator co the
+Byzantine, trong do node co the im lang, gui duplicate, equivocate, gui
+proposal sai, replay message hoac bo phieu sai. Byzantine khong the forge
+chu ky validator dung va khong the tao hash collision.
+
+Mang truoc stabilization co the delay, drop, duplicate va reorder packet.
+Sau stabilization, message giua correct nodes duoc giao trong bound Delta.
+Safety khong phu thuoc vao stabilization; liveness chi duoc yeu cau sau
+stabilization va khi correct proposer eventually duoc chon.
+
+3.3. Tham so chay mau
+
+Scenario mac dinh dung 8 node, seed 0 va finalize 3 block. Khi n = 8,
+f = floor((n - 1) / 3) = 2 va quorum la 6. Trong code, ValidatorSet va
+ProposerSelector dung cung thu tu validator de moi node tinh cung proposer
+cho (height, round).
+
+======================================================================
+4. KIEN TRUC TONG THE
+======================================================================
+
+4.1. Cac module
+
+models chua Transaction, Block, Vote, Phase, certificate va serialization.
+Moi object co ham chuyen sang dictionary canonical de dung khi hash hoac ky.
+
+crypto dung Ed25519 cho key va signature, SHA-256 cho block id va state
+commitment. Domain context tach rieng TX, HEADER va VOTE, vi vay signature
+hop le o mot loai message khong the duoc tai su dung cho loai khac.
+
+execution chua WorldState, transaction validation va block execution.
+Transaction chi duoc sua du lieu ma sender so huu, dong thoi kiem tra nonce,
+balance va signature.
+
+consensus chua engine, locking, proposer va timeout. Engine quan ly state
+height/round, vote pool, polka, lock va finalization certificate.
+
+network chua virtual network, scheduler, deterministic RNG, delay/drop/
+duplicate/reorder, rate limiter va header gate. Node wrapper ket noi tat ca
+module va cung cap event sink cho simulator.
+
+logger.py la thanh phan TV5. Logger khong dung wall-clock, UUID ngau nhien
+hay process id. Event duoc serialize JSON compact, sort key va ghi JSONL.
+main.py la entry point duy nhat cho run binh thuong.
+
+4.2. So do kien truc
+
+                 +----------------------+
+                 |       main.py        |
+                 |  config + CLI output |
+                 +----------+-----------+
+                            |
+                 +----------v-----------+
+                 | BlockchainSimulator |
+                 | virtual clock + QA  |
+                 +----+------------+----+
+                      |            |
+          +-----------v--+    +----v-----------+
+          | Network       |    | Node 1..Node N |
+          | delay/drop/...|    | engine/state   |
+          +-------+-------+    +----+-----------+
+                  |                 |
+                  +--------+--------+
+                           |
+             +-------------v-------------+
+             | consensus / crypto /     |
+             | execution / models       |
+             +-------------+-------------+
+                           |
+                    +------v------+
+                    | logger.py   |
+                    | JSONL + SHA |
+                    +-------------+
+
+Moi node co WorldState va chain rieng. Simulator khong cho node dung shared
+memory de quyet dinh consensus; network event moi la duong giao tiep giua
+cac node. Cac callback deu chay trong virtual scheduler nen cung input se
+cho cung thu tu event.
+
+======================================================================
+5. LUONG HOAT DONG CHI TIET
+======================================================================
+
+5.1. Khoi tao
+
+Nguoi dung chay:
+
+python main.py --nodes 8 --seed 0 --height 3
+
+main.py tao SimulationConfig. Simulator tao danh sach node_1 den node_8,
+seed-derived key store, proposer selector, Scheduler va Network. Mỗi node
+nhan mot private key, public key map, genesis state copy va ConsensusEngine
+rieng. Genesis block co height 0 va state root ban dau giong nhau, nhung
+WorldState la object doc lap tai moi node.
+
+Network gan receiver cho tung node. Scheduler quan ly event theo
+(virtual_time, sequence), do do hai event cung timestamp van co thu tu co
+dinh. Random delay va fault pattern deu lay tu seed cua cau hinh, khong lay
+randomness tu dong ho he thong.
+
+5.2. Tao va nap transaction
+
+Simulator tao transaction chuyen 100 don vi tu node_1 sang node_2 voi nonce
+0. Transaction duoc ky bang private key cua node_1. Moi node kiem tra
+signature truoc khi nap vao mempool. Transaction trung id, sai signature,
+sai nonce, amount am hoac vuot balance bi tu choi.
+
+Transaction chua sender, receiver, amount, nonce va signature. Khi block
+duoc execute, transaction phai hop le tren state hien tai. Neu cung mot
+ordered transaction list duoc ap dung tai moi node, ket qua balance, nonce
+va state root phai giong nhau.
+
+5.3. Proposal
+
+Tai height hien tai va round hien tai, ProposerSelector tinh proposer tu
+(height, round, validator set, seed). Proposer lay transaction tu mempool,
+execute tren state copy, tinh state root, tao block header va ky header.
+
+Proposal duoc gui qua network. Node nhan proposal khong tin nguon message
+mot cach mu quang. Node kiem tra proposer co dung voi slot khong, height,
+round va parent co khop chain local khong, signature co hop le khong,
+transaction co hop le khong, block id co khop noi dung khong va state root
+co dung sau execution khong.
+
+Network gui HEADER truoc BODY. Receiver chi tao BODY_REQUEST sau khi header
+hop le va matching. Quy tac nay ngan body khong co header, ngan block sai
+duoc dua vao execution truoc khi xac minh.
+
+5.4. Prevote va vote pool
+
+Sau khi proposal hop le, node tao prevote cho block id. Vote ky payload co
+height, round, phase, block id va voter id trong context VOTE:chain_id.
+ConsensusEngine chi cho phep mot prevote moi (height, round).
+
+VotePool luu vote theo khoa:
+
+(height, round, phase, voter_id)
+
+Neu cung validator gui lai cung vote, vote moi bi ignore. Neu validator
+gui conflicting block trong cung slot, event duoc ghi nhan nhung vote thu
+hai khong duoc dem. Vote tu validator ngoai set, sai signature, sai height,
+sai phase hoac block chua duoc biet deu bi reject.
+
+Khi co 2f + 1 prevote cho cung block, node tao polka. Polka la bang chung
+cho block da duoc quorum ung ho, khong phai chi la so luong packet nhan
+duoc.
+
+5.5. Lock va precommit
+
+Polka hop le lam node lock block tai round do. Lock ghi locked_block_id va
+locked_round. Node sau do khong duoc prevote block khac trong cung height
+neu khong co higher-round polka. Timeout, proposal moi hoac mot precommit
+don le khong du de mo lock.
+
+Sau khi quan sat polka, node ky precommit cho block. Precommit cung duoc
+deduplicate va verify signature. Mot precommit khong co polka tuong ung
+khong duoc dung de finalize. Neu round timeout truoc khi co polka, node
+chuyen round theo TimeoutManager va co the phat nil vote; nil khong tao lock.
+
+Quy tac nay dam bao validator dung khong ky hai block xung dot trong cung
+height. Hai quorum 2f + 1 co giao nhau it nhat f + 1 validator; trong so
+do co it nhat mot correct validator. Correct validator tuan thu lock nen
+khong the cung cap precommit hop le cho hai block xung dot.
+
+5.6. Finalize va state transition
+
+Khi VotePool co quorum precommit cho block, engine tao
+FinalizeCertificate. Node kiem tra lai certificate, so validator duy nhat,
+signature, block id, phase, height, round va polka/block validity.
+
+Node commit dung mot lan: them block vao chain, ap dung transaction vao
+WorldState, luu certificate, phat event COMMIT va chuyen engine sang height
+moi. Neu commit lai block da co trong chain, node khong apply transaction
+lan hai. Message cu cua height da finalize bi loai.
+
+Sau commit height 1, proposer cho height 2 duoc tinh lai. Qua trinh lap lai
+cho den target height 3. Cuoi run, simulator kiem tra parent continuity,
+certificate, engine height, chain chung va state root.
+
+5.7. Timeout va round change
+
+Moi slot (height, round) co timer. Neu proposer im lang, crash hoac proposal
+khong hop le, timer kich hoat on_timeout. Engine tang round, scheduler vao
+round moi va proposer tiep theo duoc chon deterministic.
+
+Trong round moi, lock cu van duoc giu. Chi higher-round polka cho block khac
+moi cho phep unlock/chuyen lock. Do do timeout khong lam mat safety. Khi
+network tro lai on dinh, proposal va vote hop le co the di den quorum va
+chain tiep tuc finalize.
+
+======================================================================
+6. DETERMINISTIC LOGGING VA T8
+======================================================================
+
+6.1. Noi dung log
+
+Moi node event co time, node_id, event, height va round. Network event co
+source network va thong tin sender/receiver, kind, height va virtual time.
+Log bao gom proposal, reject reason, vote, timeout, body handshake, commit,
+drop, duplicate, delay, rate limit, block/unblock va cac event anh huong
+outcome.
+
+6.2. Canonical encoding
+
+logger.py dung json.dumps voi ensure_ascii=True, sort_keys=True, separators
+compact va allow_nan=False. Moi event la mot dong UTF-8 va file ket thuc
+bang newline. Khong ghi memory address, absolute path, real timestamp hay
+gia tri ngau nhien. SHA-256 cua byte payload duoc ghi vao summary.
+
+6.3. Quy trinh T8
+
+main.py chay scenario lan dau va ghi logs/run.jsonl. Sau do main tao mot
+simulator moi voi cung nodes, seed, height va cung transaction; run lan hai
+chi dung trong bo nho. Hai tuple event duoc canonicalize va so sanh byte.
+State roots by node cung duoc so sanh, dong thoi kiem tra cac correct node
+co cung root.
+
+T8 thanh cong khi:
+
+logs_byte_identical = true
+state_hash_identical = true
+all_nodes_agree = true
+completed = true
+
+Voi scenario nodes=8, seed=0, height=3, log SHA-256 da ghi nhan la:
+
+4bcc61961804b16077f95d75d845ac5098c994b90b6591e43e3006263eae32a4
+
+State hash cua bo state roots da ghi nhan la:
+
+2e0041ba568dde204d4e81a49a0fd6c6431b07777dfe095bcc289e05c459f321
+
+======================================================================
+7. TESTING VA KET QUA
+======================================================================
+
+7.1. Unit test
+
+Crypto test signature hop le, payload bi tamper, sai domain, sai phase va
+signature cua loai message khac. Execution test sender ownership, nonce,
+balance, duplicate transaction va deterministic state root. Consensus test
+vote counting, duplicate guard, polka, lock, higher-round unlock,
+certificate va old-height rejection. Network test header-before-body,
+delay/drop/duplicate/reorder, rate limit va timeout.
+
+7.2. End-to-end acceptance matrix
+
+T1 - Normal run:
+8 hoac 10 node finalize cung chain va cung state root.
+
+T2 - Duplicate/reordered messages:
+network tao duplicate va delay khac nhau; VotePool van chi dem mot vote
+moi validator va chain van giong nhau.
+
+T3 - Invalid signature/wrong domain:
+tamper payload, dung transaction signature lam vote signature va dung phase
+khac deu bi reject, khong lam thay doi state.
+
+T4 - Replayed transaction:
+duplicate truoc commit va replay sau commit chi duoc admit/applied toi da
+mot lan; nonce va balance khong bi ap dung hai lan.
+
+T5 - Drop/delay before synchrony:
+message bi mat hoac tre truoc stabilization; correct nodes khong finalize
+conflicting blocks. Sau stabilization, chain tiep tuc.
+
+T6 - Silent/crashed proposer:
+timeout tang round, proposer tiep theo duoc chon va chain tiep tuc finalize.
+
+T7 - Byzantine equivocation:
+toi da f validator gui conflicting vote; duplicate/equivocation khong lam
+quorum sai va khong co conflicting finalization.
+
+T8 - Same seed rerun:
+hai lan chay tao log byte-identical va state hash identical.
+
+7.3. Ket qua chay thuc te
+
+Lenh regression:
+
+python -m pytest tests -q
+
+Ket qua: 253 passed, 1 warning tu pytest/anyio deprecation, khong co test
+failure. Warning nay khong lam thay doi simulator behavior.
+
+Lenh mot buoc cho nguoi dung:
+
+python main.py --nodes 8 --seed 0 --height 3
+
+Lenh nay da hoan thanh simulation, ghi log, ghi summary va tu audit T8.
+Checker doc lap van co the dung de review rieng:
+
+python scripts/deterministic_check.py --nodes 8 --seed 0 --height 3
+
+======================================================================
+8. BUG, ANOMALY VA CACH KHAC PHUC
+======================================================================
+
+Duplicate vote co the lam quorum ao neu dem theo so packet. Khac phuc bang
+vote key co voter_id va reject vote trung/conflicting trong cung slot.
+
+Precommit co the den truoc prevote do reorder. Khac phuc bang pending vote
+va chi tao certificate sau khi polka hop le duoc quan sat.
+
+Body co the den truoc header. Khac phuc bang header gate va BODY_REQUEST;
+node khong execute body khong co matching header.
+
+Replay transaction co the lam balance thay doi hai lan. Khac phuc bang
+transaction id, nonce validation, mempool duplicate guard va commit exact
+once.
+
+Proposer silent co the lam he thong dung neu khong co timeout. Khac phuc
+bang TimeoutManager, round change va proposer round-robin deterministic.
+
+Log co the khac giua hai run neu dung wall-clock hoac unordered map output.
+Khac phuc bang virtual timestamp, sort_keys, canonical JSONL va seed co dinh.
+
+======================================================================
+9. HUONG DAN CHAY VA CAU TRUC BAN GIAO
+======================================================================
+
+Trong thu muc Lab01_Bloackchain_layer_1:
+
+1. Cai Python 3.10+ va dependency:
+   python -m pip install -r requirements.txt
+
+2. Chay mot lenh:
+   python main.py --nodes 8 --seed 0 --height 3
+
+3. Xem ket qua:
+   logs/run.jsonl
+   logs/summary.json
+
+4. Chay day du regression neu can:
+   python -m pytest tests -v
+
+5. Doi ten folder theo mau Lab01_ID1_ID2_ID3_ID4_ID5, chuyen bao cao nay
+   sang REPORT.pdf va nen folder thanh Lab01_ID1_ID2_ID3_ID4_ID5.zip.
+
+Khong dua source code vao report. Report chi mo ta thiet ke, flow, guard,
+testing va ket qua.
+
+======================================================================
+10. TAI LIEU THAM KHAO VA CHECKLIST
+======================================================================
+
+1. Lab 01 - Blockchain course, Knowledge Engineering Department, 2026.
+2. NIST, FIPS PUB 180-4, Secure Hash Standard (SHA-256).
+3. RFC 8032, Edwards-Curve Digital Signature Algorithm (Ed25519).
+4. Python cryptography package documentation.
+5. Tai lieu va README cua project simulator.
+
+Checklist truoc khi nop:
+
+[ ] Dien ten va ma so 5 thanh vien.
+[ ] Chinh lai so do neu can va chen caption.
+[ ] Dien ket qua T1-T8 va SHA-256 tu run cuoi.
+[ ] Chuyen REPORT.txt thanh REPORT.pdf, toi da 10 trang.
+[ ] Folder co src/, tests/, logs/, config/, README.md, REPORT.pdf.
+[ ] Loai bo cache Python va file tam.
+[ ] Dat dung ten Lab01_ID1_ID2_ID3_ID4_ID5.
+[ ] Tao ZIP cung ten va kiem tra mo duoc.
