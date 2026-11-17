@@ -1,0 +1,29 @@
+{
+  "run": {
+    "nodes": 8,
+    "seed": 7,
+    "height": 3,
+    "log": "logs/unstable_run.jsonl",
+    "summary": "logs/unstable_summary.json"
+  },
+  "simulation": {
+    "gossip_interval": 0.05,
+    "max_transactions": 100
+  },
+  "network": {
+    "min_delay": 0.001,
+    "max_delay": 0.02,
+    "drop_rate": 0.4,
+    "duplicate_rate": 0.5,
+    "pre_synchrony_max_delay": 0.15,
+    "stabilize_at": 0.4
+  },
+  "timeout": {
+    "base": 0.5,
+    "multiplier": 1.5,
+    "max_timeout": 2.0,
+    "jitter": 0.0,
+    "seed": 7,
+    "max_round": 64
+  }
+}

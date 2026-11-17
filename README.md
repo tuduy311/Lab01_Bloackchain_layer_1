@@ -18,57 +18,89 @@ Byzantine. Mạng có thể không ổn định trước thời điểm đồng 
 điệp giữa các node đúng được phân phối trong một khoảng thời gian giới hạn.
 
 ## 2. Thành viên
-- TV1: Consensus
-- TV2: Models, Cryptography, Execution
-- TV3: Network, Scheduler, Proposer, Timeout
-- TV4: Integration and Testing
-- TV5: Logging, Monitoring, Replay
+
+| Thành viên | MSSV | Phụ trách |
+| --- | --- | --- |
+| TV1 - Tú | ... | Consensus |
+| TV2 - Tuấn | ... | Models, Cryptography, Execution |
+| TV3 - Phú | ... | Network, Scheduler, Proposer, Timeout |
+| TV4 - Phong | ... | Integration and Testing |
+| TV5 - Trí | ... | Logging, Monitoring, Replay |
 
 ## 3. Cấu trúc dự án
 
+Thư mục gốc phải đặt tên theo cú pháp `Lab01_ID1_ID2_ID3_ID4_ID5` (ID1–ID5 là
+MSSV của 5 thành viên) và được nén thành file `.zip` cùng tên. Bên trong chỉ có
+sáu thành phần theo quy định của đề bài:
+
 ```text
-Lab01_Bloackchain_layer_1/
+Lab01_ID1_ID2_ID3_ID4_ID5/
 ├── src/
-│   ├── consensus/              # Cơ chế đồng thuận BFT
+│   ├── consensus/
 │   │   ├── engine.py           # Máy trạng thái consensus
-│   │   └── locking.py          # Quy tắc locking/unlocking
-│   ├── models/                 # Block, Vote, Transaction, Message
+│   │   ├── locking.py          # Quy tắc locking/unlocking
+│   │   ├── proposer.py         # Chọn proposer theo (height, round)
+│   │   └── timeout.py          # Round timeout
 │   ├── crypto/                 # Chữ ký, hash, canonical encoding
 │   ├── execution/              # State và thực thi giao dịch
+│   ├── models/                 # Block, Vote, Transaction, Message
 │   ├── network/                # Mạng mô phỏng
+│   ├── blockchain_simulator.py # Điều phối network + các node
+│   ├── config.py               # Đọc cấu hình từ config/
+│   ├── deterministic_check.py  # Script kiểm tra tính tất định (T8)
+│   ├── logger.py               # Log canonical JSONL
+│   ├── main.py                 # Entry point: python -m src.main
 │   ├── node.py                 # Node tích hợp các module
-│   └── blockchain_simulator.py # Điểm chạy mô phỏng
-├── tests/                      # Unit test và end-to-end test
-├── scenarios/                  # Các kịch bản lỗi và Byzantine
-├── config/                     # Cấu hình số node, seed, timeout
-├── logs/                       # Log sinh ra khi chạy
-├── scripts/                    # Script kiểm tra tính xác định
-│   └── deterministic_check.py
-├── main.py                     # Entry point duy nhất
-├── REPORT.txt                  # Nội dung báo cáo, tự chuyển sang PDF
+│   └── scheduler.py            # Virtual-time scheduler
+├── tests/                      # Unit test và end-to-end test T1--T8
+├── config/
+│   ├── simulation.json         # Cấu hình chạy mặc định
+│   ├── scenario_unstable_network.json
+│   └── README.md               # Mô tả các khóa cấu hình
+├── logs/                       # run.jsonl, summary.json sinh ra khi chạy
 ├── README.md
-└── REPORT.pdf                  # Tạo từ REPORT.txt khi nộp
+└── REPORT.pdf
 ```
+
+Không còn thư mục `scripts/` hay cấu hình hard-code: entry point, checker T8 và
+toàn bộ tham số mạng/timeout đều nằm trong `src/` và `config/`.
 
 ## 4. Cài đặt và chạy
 
-PowerShell trên Windows:
+Yêu cầu Python 3.10+ và chạy mọi lệnh từ **thư mục gốc dự án** (thư mục chứa
+`src/`, `tests/`, `config/`):
 
 ```powershell
-cd C:\Users\tuduy\Documents\blockchain\lab01\Lab01_Bloackchain_layer_1
+cd Lab01_ID1_ID2_ID3_ID4_ID5
 python -m pip install -r requirements.txt
-python main.py --nodes 8 --seed 0 --height 3
+python -m src.main
 ```
 
-Đây là lệnh chạy đầy đủ một scenario: tạo validator set, khởi tạo genesis
-state, ký và nạp transaction, chạy mạng/consensus đến height yêu cầu, ghi log
-chuẩn hóa, rồi tự chạy lại cùng scenario để kiểm tra T8. Kết quả được ghi vào
-`logs/run.jsonl` và `logs/summary.json`. Timestamp trong log là virtual time
-của simulator, không phải đồng hồ hệ thống.
+`python -m src.main` là lệnh chạy đầy đủ một scenario: đọc
+`config/simulation.json`, tạo validator set, khởi tạo genesis state, ký và nạp
+transaction, chạy mạng/consensus đến height yêu cầu, ghi log chuẩn hóa, rồi tự
+chạy lại cùng scenario để kiểm tra T8. Kết quả được ghi vào `logs/run.jsonl` và
+`logs/summary.json`; thư mục `logs/` được tạo tự động nếu chưa có. Timestamp
+trong log là virtual time của simulator, không phải đồng hồ hệ thống.
 
-Các tham số có thể thay đổi:
+Mặc định lấy từ `config/simulation.json`: 8 node, seed 0, finalize 3 block, log
+`logs/run.jsonl`. Muốn chạy kịch bản mạng bất ổn định (drop/duplicate/delay
+trước thời điểm stabilize):
+
+```powershell
+python -m src.main --config config/scenario_unstable_network.json
+```
+
+Đổi tham số của một run mà không sửa file cấu hình:
+
+```powershell
+python -m src.main --nodes 8 --seed 0 --height 3
+```
+
+Các tham số dòng lệnh (đều ghi đè lên file cấu hình):
 
 ```text
+--config  file cấu hình JSON/YAML (mặc định config/simulation.json)
 --nodes   số validator (mặc định 8)
 --seed    seed tái lập mạng và key mô phỏng (mặc định 0)
 --height  số block cần finalize (mặc định 3)
@@ -76,9 +108,14 @@ Các tham số có thể thay đổi:
 --summary đường dẫn summary (mặc định logs/summary.json)
 ```
 
+Các tham số mạng (delay, drop rate, duplicate rate, stabilize time, rate limit)
+và timeout (base, multiplier, max timeout) nằm trong `config/*.json`; chi tiết
+từng khóa xem tại [`config/README.md`](config/README.md).
+
 ### 4.1. Luồng chạy một lệnh
 
-1. `main.py` đọc tham số và tạo `SimulationConfig`.
+1. `src/main.py` đọc `config/simulation.json` (hoặc file `--config`), áp dụng
+   tham số dòng lệnh và tạo `SimulationConfig`.
 2. `BlockchainSimulator` tạo scheduler, network, validator keys,
    proposer selector và các node độc lập.
 3. Transaction được ký bằng Ed25519 và gửi đến mempool của các node.
@@ -90,7 +127,7 @@ Các tham số có thể thay đổi:
 7. Quorum PREVOTE tạo polka; node lock block và phát PRECOMMIT.
 8. Quorum PRECOMMIT tạo certificate; node kiểm tra certificate, commit block
    đúng một lần và chuyển sang height tiếp theo.
-9. Khi đạt `--height`, simulator kiểm tra chain, certificate và state root của
+9. Khi đạt `height`, simulator kiểm tra chain, certificate và state root của
    các correct node.
 10. Cùng scenario được chạy lại trong bộ nhớ. Hai log canonical và state root
     được so sánh để báo kết quả T8.
@@ -99,19 +136,25 @@ Vì vậy sau khi đã cài dependency, người dùng chỉ cần một lệnh 
 trình:
 
 ```powershell
-python main.py --nodes 8 --seed 0 --height 3
+python -m src.main
 ```
 
 ## 5. Kiểm tra T1--T8
 
 ```powershell
 python -m pytest tests -v
-python scripts/deterministic_check.py --nodes 8 --seed 0 --height 3
+python -m src.deterministic_check
 ```
 
-Lệnh `main.py` đã tự kiểm tra T8 cho scenario bình thường. Lệnh trên là
-checker độc lập dùng khi cần audit riêng. T8 chỉ đạt khi
-`logs_byte_identical`, `state_hash_identical`, `all_nodes_agree` và
+`python -m pytest tests -v` là điểm chạy kiểm thử duy nhất: nó gọi toàn bộ unit
+test (crypto, execution, models, network, consensus) và end-to-end test T1--T8.
+`python -m src.deterministic_check` là checker T8 độc lập: chạy cùng scenario
+hai lần rồi so sánh từng byte log và state hash, thoát với mã `0` khi mọi điều
+kiện đều đạt. Thêm `--config config/scenario_unstable_network.json` (hoặc
+`--nodes/--seed/--height`) để kiểm tra một cấu hình khác.
+
+Lệnh `python -m src.main` đã tự kiểm tra T8 cho scenario bình thường. T8 chỉ
+đạt khi `logs_byte_identical`, `state_hash_identical`, `all_nodes_agree` và
 `completed` đều là `true`.
 
 ## 6. Đặc tả Consensus State Machine (TV1, TV2, TV4)

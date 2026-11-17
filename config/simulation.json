@@ -1,0 +1,37 @@
+{
+  "run": {
+    "nodes": 8,
+    "seed": 0,
+    "height": 3,
+    "log": "logs/run.jsonl",
+    "summary": "logs/summary.json"
+  },
+  "simulation": {
+    "gossip_interval": 0.25,
+    "max_transactions": 100
+  },
+  "network": {
+    "min_delay": 0.01,
+    "max_delay": 0.05,
+    "drop_rate": 0.0,
+    "duplicate_rate": 0.0,
+    "pre_synchrony_max_delay": null,
+    "stabilize_at": null,
+    "enforce_header_gate": true,
+    "rate_limit": {
+      "capacity": 32,
+      "refill_per_second": 64.0,
+      "inbound_capacity": 64,
+      "inbound_window": 1.0,
+      "peer_block_duration": 2.0
+    }
+  },
+  "timeout": {
+    "base": 1.0,
+    "multiplier": 1.5,
+    "max_timeout": 30.0,
+    "jitter": 0.0,
+    "seed": 0,
+    "max_round": 64
+  }
+}
